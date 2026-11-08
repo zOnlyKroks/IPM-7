@@ -1,0 +1,154 @@
+name: argos
+
+# Gesamtsystem lokal:  docker compose up --build
+# Optional:            Kopie von .env.example als .env anlegen, um Standardwerte zu ueberschreiben
+# GPU fuer Ollama:     siehe README (docker-compose.nvidia.yml / docker-compose.amd.yml)
+
+x-python-module: &python-module
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-argos}:${POSTGRES_PASSWORD:-argos}@postgres:5432/${POSTGRES_DB:-argos}
+    OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+    LIBRETRANSLATE_URL: http://libretranslate:5000
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- Infrastruktur
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-argos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-argos}
+      POSTGRES_DB: ${POSTGRES_DB:-argos}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro   # SQL-Dateien hier laufen beim allerersten Start
+    ports:
+      - "127.0.0.1:5432:5432"   # nur fuer Entwickler, im Betrieb entfernen
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-argos} -d ${POSTGRES_DB:-argos}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  # Laedt die Modelle einmalig herunter (beim ersten Start kann das einige Minuten dauern)
+  ollama-pull:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${LLM_MODEL:-qwen2.5:7b} && ollama pull ${EMBED_MODEL:-bge-m3}"]
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    restart: unless-stopped
+    environment:
+      LT_LOAD_ONLY: ${LT_LOAD_ONLY:-en,de,fr}
+    volumes:
+      - lt_models:/home/libretranslate/.local
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    # n8n/init.sh legt die Ollama-Zugangsdaten aus OLLAMA_URL an und startet danach n8n
+    entrypoint: ["tini", "--", "/bin/sh", "/init/init.sh"]
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-dev-n8n-key}
+      GENERIC_TIMEZONE: Europe/Berlin
+      TZ: Europe/Berlin
+      WEBHOOK_URL: http://n8n:5678/
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"   # Workflows lesen die Schluessel per $env
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+      - ./n8n/init.sh:/init/init.sh:ro
+    ports:
+      - "127.0.0.1:5678:5678"   # n8n-Oberflaeche, nur lokal
+    depends_on:
+      m1:
+        condition: service_healthy
+      m2:
+        condition: service_healthy
+      m3:
+        condition: service_healthy
+      m4:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- Module
+  m1:
+    <<: *python-module
+    build: ./m1_ingest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      libretranslate:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8001:8000"   # direkter Zugriff zum Testen
+
+  m2:
+    <<: *python-module
+    build: ./m2_analysis
+    ports:
+      - "127.0.0.1:8002:8000"
+
+  m3:
+    <<: *python-module
+    build: ./m3_risk
+    ports:
+      - "127.0.0.1:8003:8000"
+
+  m4:
+    <<: *python-module
+    build: ./m4_api
+    ports:
+      - "127.0.0.1:8004:8000"
+
+  # ---------------------------------------------------------------- Einstiegspunkt
+  # Einziger Dienst, der nach aussen erreichbar sein soll: Weboberflaeche + Reverse-Proxy auf die API (m4)
+  web:
+    build: ./web
+    restart: unless-stopped
+    depends_on:
+      m4:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+volumes:
+  pgdata:
+  ollama:
+  lt_models:
+  n8n_data:
