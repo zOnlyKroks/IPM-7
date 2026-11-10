@@ -1,0 +1,11 @@
+# Ollama mit NVIDIA-GPU (Linux oder Windows mit Docker Desktop + WSL2, NVIDIA-Treiber installiert)
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up --build
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

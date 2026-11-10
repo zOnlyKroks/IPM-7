@@ -1,0 +1,10 @@
+# Ollama mit AMD-GPU (ROCm), nur unter Linux. Unter Windows siehe README (Ollama nativ auf dem Host).
+#   docker compose -f docker-compose.yml -f docker-compose.amd.yml up --build
+services:
+  ollama:
+    image: ollama/ollama:rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video

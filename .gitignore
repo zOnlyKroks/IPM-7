@@ -1,0 +1,23 @@
+# Geheimnisse und lokale Konfiguration
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Frontend
+node_modules/
+dist/
+
+# IDE und Betriebssystem
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# lokale Daten
+*.log
