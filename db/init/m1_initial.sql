@@ -85,6 +85,8 @@ COMMENT ON TABLE fetch_runs IS 'Abrufprotokoll je Quelle. Letzter Status einer Q
 COMMENT ON COLUMN fetch_runs.fetch_state IS 'ETag, Last-Modified oder Zeitstempel fuer den naechsten inkrementellen Abruf.';
 
 CREATE INDEX fetch_runs_source_started_idx ON fetch_runs (source_id, started_at DESC);
+CREATE INDEX fetch_runs_last_success_idx
+    ON fetch_runs (source_id, started_at DESC) WHERE status = 'success';
 
 -- ---------------------------------------------------------------- raw_items
 -- Normalisierte Meldungen. Nach der Freigabe (translation_status <> 'pending') unveraendert.
@@ -107,10 +109,11 @@ CREATE TABLE raw_items (
     cve_ids              text[]      NOT NULL DEFAULT '{}',
     published_at         timestamptz,
     fetched_at           timestamptz NOT NULL DEFAULT now(),
-    content_hash         text        NOT NULL UNIQUE
+    content_hash         text        NOT NULL
         CHECK (content_hash ~ '^[0-9a-f]{64}$'),
     raw_payload          jsonb,
     UNIQUE (source_id, external_id),
+    UNIQUE (source_id, content_hash),
     -- uebersetzte und deutsche Meldungen haben immer einen deutschen Text
     CHECK (translation_status NOT IN ('done', 'not_needed')
            OR (title_de IS NOT NULL AND body_de IS NOT NULL)),
@@ -120,12 +123,13 @@ CREATE TABLE raw_items (
 );
 
 COMMENT ON TABLE raw_items IS 'Normalisierte Meldungen. Offen fuer M2: translation_status <> ''pending'' und noch keine M2-Zeile. Text lesen mit COALESCE(title_de, title), COALESCE(body_de, body).';
-COMMENT ON COLUMN raw_items.content_hash IS 'SHA-256 (hex, kleingeschrieben) von normalisiertem Titel und Text. Identische Inhalte aus anderen Quellen werden verworfen.';
+COMMENT ON COLUMN raw_items.content_hash IS 'SHA-256 (hex, kleingeschrieben) von normalisiertem Titel und Text. Eindeutig nur je Quelle; identische Inhalte aus anderen Quellen bleiben erhalten (Bestaetigung durch unabhaengige Quellen, z. B. GROUP BY content_hash).';
 COMMENT ON COLUMN raw_items.published_at IS 'NULL, wenn die Quelle kein Datum liefert. Dann gilt fetched_at.';
 
 CREATE INDEX raw_items_cve_ids_idx      ON raw_items USING gin (cve_ids);
 CREATE INDEX raw_items_pending_idx      ON raw_items (id) WHERE translation_status = 'pending';
 CREATE INDEX raw_items_fetch_run_id_idx ON raw_items (fetch_run_id);
+CREATE INDEX raw_items_content_hash_idx ON raw_items (content_hash);
 
 -- ---------------------------------------------------------------- cve_facts
 -- Eine Zeile pro CVE. NULL heisst "unbekannt", nicht 0.
