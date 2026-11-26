@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import secrets
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 
-from . import ingest, translate
+from . import ingest, nvd_mirror, translate
 from .config import settings
 from .db import close_pool, get_pool
 
@@ -22,6 +23,9 @@ async def lifespan(app: FastAPI):
             logging.getLogger("m1").warning("%d haengende Abrufe als fehlgeschlagen markiert", n)
     except Exception:
         logging.getLogger("m1").exception("Aufraeumen haengender Abrufe fehlgeschlagen")
+    # Einmalige Erstbefuellung (kein Zeitplan): kompletter NVD-Bestand, im Hintergrund
+    if settings().nvd_mirror_on_start:
+        threading.Thread(target=nvd_mirror.run_until_complete, name="nvd-mirror", daemon=True).start()
     yield
     close_pool()
 

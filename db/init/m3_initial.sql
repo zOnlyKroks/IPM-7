@@ -84,6 +84,8 @@ CREATE TABLE m3.sbom_components (
     vendor_country      text        CHECK (vendor_country ~ '^[A-Z]{2}$'),      -- ISO 3166-1 alpha-2, fuer vendor_exposure
     cpe23               text        CHECK (cpe23 LIKE 'cpe:2.3:%'),
     purl                text        CHECK (purl LIKE 'pkg:%'),
+    osv_ecosystem       text,                                                   -- aus der purl abgeleitet, z. B. "npm", "PyPI", "Go"
+    osv_package         text,                                                   -- Paketname wie in OSV (PyPI normalisiert); NULL = nicht abgleichbar (z. B. deb/apk)
     image_ref           text,                                                   -- nur sbom, z. B. "n8nio/n8n:1.70.1"
     sbom_sha256         text        CHECK (sbom_sha256 ~ '^[0-9a-f]{64}$'),     -- nur sbom
     is_active           boolean     NOT NULL DEFAULT true,
@@ -112,6 +114,7 @@ CREATE INDEX sbom_components_asset_idx          ON m3.sbom_components (asset_id)
 CREATE INDEX sbom_components_parent_idx         ON m3.sbom_components (parent_component_id);
 CREATE INDEX sbom_components_vendor_product_idx ON m3.sbom_components (vendor_norm, product_norm);
 CREATE INDEX sbom_components_purl_idx           ON m3.sbom_components (purl);
+CREATE INDEX sbom_components_osv_idx            ON m3.sbom_components (osv_ecosystem, osv_package) WHERE is_active;
 
 CREATE TRIGGER sbom_components_touch_updated_at BEFORE UPDATE ON m3.sbom_components
     FOR EACH ROW EXECUTE FUNCTION m3.touch_updated_at();
@@ -124,7 +127,7 @@ CREATE TRIGGER sbom_components_touch_updated_at BEFORE UPDATE ON m3.sbom_compone
 -- =====================================================================
 CREATE TABLE m3.matches (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    raw_item_id     bigint       NOT NULL REFERENCES public.raw_items (id),
+    raw_item_id     bigint       REFERENCES public.raw_items (id),   -- NULL = Fund direkt aus dem Inventar, ohne Meldung
     component_id    bigint       NOT NULL REFERENCES m3.sbom_components (id),
     cve_id          text         CHECK (cve_id ~ '^CVE-[0-9]{4}-[0-9]{4,}$'),
     match_key       text         NOT NULL,
@@ -142,7 +145,8 @@ CREATE TABLE m3.matches (
                         'advisory_changed', 'suppressed')),
     created_at      timestamptz  NOT NULL DEFAULT now(),
     updated_at      timestamptz  NOT NULL DEFAULT now(),
-    UNIQUE (raw_item_id, component_id, match_key),
+    UNIQUE NULLS NOT DISTINCT (raw_item_id, component_id, match_key),
+    CHECK (raw_item_id IS NOT NULL OR cve_id IS NOT NULL),
     CHECK (match_key = coalesce(cve_id, 'raw:' || raw_item_id)),
     -- CVE-Pfade brauchen eine CVE, vendor_exposure prueft keine Version
     CHECK (match_method NOT IN ('cpe_version', 'purl_version', 'cpe_product_only') OR cve_id IS NOT NULL),
@@ -209,6 +213,8 @@ CREATE TABLE m3.risk_assessments (
     trust_label       text         CHECK (trust_label IN ('CONFIRMED', 'UNCONFIRMED', 'CONTRADICTORY')),
     category          text         NOT NULL,         -- M2 summaries.category zum Bewertungszeitpunkt
     factor_breakdown  jsonb        NOT NULL CHECK (jsonb_typeof(factor_breakdown) = 'object'),
+    -- Faelle, die ein Mensch pruefen muss: [{"code": "version_unknown", "text": "..."}], leer = keine
+    manual_checks     jsonb        NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(manual_checks) = 'array'),
     risk_fingerprint  text         NOT NULL,
     assessed_at       timestamptz  NOT NULL DEFAULT now(),
     -- vendor_exposure ist hoechstens medium (kein CVSS/KEV/EPSS, Namensabgleich)
@@ -288,9 +294,10 @@ SELECT
     m.resolved_at,
     m.resolved_reason,
     r.id                              AS raw_item_id,
-    coalesce(r.title_de, r.title)     AS title,
-    r.url,
-    coalesce(r.published_at, r.fetched_at) AS published_at,
+    coalesce(r.title_de, r.title, 'Bekannte Schwachstelle ' || m.cve_id || ' im Inventar') AS title,
+    coalesce(r.url, 'https://nvd.nist.gov/vuln/detail/' || m.cve_id) AS url,
+    coalesce(r.published_at, r.fetched_at,
+             (SELECT f.published_at FROM public.cve_facts f WHERE f.cve_id = m.cve_id), m.created_at) AS published_at,
     m.cve_id,
     ra.category,
     ra.trust_score,
@@ -317,6 +324,7 @@ SELECT
     ra.risk_level,
     ra.action_code,
     ra.deadline_at,
+    ra.manual_checks,
     ra.factor_breakdown,
     ra.assessed_at,
     (SELECT jsonb_object_agg(rec.audience, rec.text)
@@ -328,7 +336,7 @@ SELECT
 FROM m3.matches m
 JOIN m3.sbom_components c ON c.id = m.component_id
 JOIN m3.assets a          ON a.id = c.asset_id
-JOIN public.raw_items r   ON r.id = m.raw_item_id
+LEFT JOIN public.raw_items r ON r.id = m.raw_item_id
 LEFT JOIN m3.risk_assessments ra ON ra.match_id = m.id AND ra.is_current;
 
 COMMENT ON VIEW m3.findings_history IS
@@ -341,7 +349,12 @@ FROM m3.findings_history
 WHERE status = 'open'
   AND asset_is_active
   AND component_is_active
-  AND risk_assessment_id IS NOT NULL;
+  AND risk_assessment_id IS NOT NULL
+  -- Inventarfund ausblenden, wenn dieselbe CVE auf derselben Komponente schon ueber eine Meldung offen ist
+  AND (raw_item_id IS NOT NULL OR NOT EXISTS (
+        SELECT 1 FROM m3.matches x
+         WHERE x.component_id = findings_history.component_id AND x.cve_id = findings_history.cve_id
+           AND x.raw_item_id IS NOT NULL AND x.status = 'open'));
 
 COMMENT ON VIEW m3.findings_current IS
     'Aktuelle Befunde fuer Uebersicht, Detailansicht und Benachrichtigung. M4 benachrichtigt je risk_assessment_id einmal.';

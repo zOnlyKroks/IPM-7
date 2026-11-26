@@ -9,6 +9,9 @@ from ..models import FetchResult
 
 DEFAULT_URL = "https://api.osv.dev/v1/vulns"
 _RANGE_TYPES = {"ECOSYSTEM", "SEMVER"}
+# Der Eintrag zur CVE-ID enthaelt meist nur Git-Bereiche; die Pakete stehen in diesen Alias-Eintraegen.
+_PACKAGE_ALIASES = ("GHSA-", "PYSEC-", "RUSTSEC-", "GO-")
+_MAX_ALIASES = 10
 
 
 def parse_vuln(vuln: dict) -> list[dict]:
@@ -45,6 +48,29 @@ def parse_vuln(vuln: dict) -> list[dict]:
     return rows
 
 
+def _get_vuln(http, url: str) -> dict | None:
+    try:
+        return http.get(url).json()
+    except FetchError as exc:
+        if exc.status == 404:
+            return None             # OSV kennt diese ID (noch) nicht
+        raise
+
+
+def load_rows(http, base: str, cve_id: str) -> list[dict] | None:
+    """Paketzeilen zu einer CVE inklusive Alias-Eintraegen. None, wenn OSV die CVE nicht kennt."""
+    vuln = _get_vuln(http, f"{base}/{cve_id}")
+    if vuln is None:
+        return None
+    rows = parse_vuln(vuln)
+    aliases = [a for a in vuln.get("aliases") or [] if a.startswith(_PACKAGE_ALIASES)]
+    for alias in aliases[:_MAX_ALIASES]:
+        other = _get_vuln(http, f"{base}/{alias}")
+        if other and not other.get("withdrawn"):
+            rows += parse_vuln(other)
+    return rows
+
+
 def fetch(source: dict, state: dict | None, http, conn) -> FetchResult:
     cfg = source.get("config") or {}
     batch = int(cfg.get("batch", 200))
@@ -61,14 +87,11 @@ def fetch(source: dict, state: dict | None, http, conn) -> FetchResult:
     base = (source["url"] or DEFAULT_URL).rstrip("/")
     changed = 0
     for row in todo:
-        try:
-            resp = http.get(f"{base}/{row['cve']}")
-        except FetchError as exc:
-            if exc.status == 404:
-                continue            # OSV kennt diese CVE (noch) nicht
-            raise
+        rows = load_rows(http, base, row["cve"])
+        if rows is None:
+            continue
         facts.ensure_stub(conn, [row["cve"]])
-        if facts.replace_affected(conn, row["cve"], "osv", parse_vuln(resp.json())):
+        if facts.replace_affected(conn, row["cve"], "osv", rows):
             changed += 1
     next_since = todo[-1]["first_seen"] if len(todo) >= batch else started
     return FetchResult(state={"since": next_since.isoformat()}, seen=len(todo), changed=changed)

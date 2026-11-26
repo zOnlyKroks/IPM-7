@@ -17,7 +17,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from . import config
+from . import config, recommend
 from .matching import Candidate, match_cves
 from .risk import Policy, RiskInput, score
 
@@ -25,6 +25,7 @@ log = logging.getLogger("m3.pipeline")
 
 CVE_CATEGORIES = {"VULNERABILITY", "ATTACK"}
 NVD_URL = "https://nvd.nist.gov/vuln/detail/{}"
+OSV_URL = "https://osv.dev/vulnerability/{}"
 KEV_URL = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
 EPSS_URL = "https://www.first.org/epss/"
 
@@ -183,14 +184,20 @@ def _resolve_reason(conn, row, not_affected: set, suppressed: set) -> str:
     return "advisory_changed"
 
 
-def reconcile_matches(conn, raw_item_id: int, candidates: dict[tuple[int, str], Candidate],
+def _of_item(column: str, raw_item_id: int | None) -> tuple[str, tuple]:
+    """WHERE-Teil fuer die Treffer einer Meldung bzw. (None) die Inventarfunde ohne Meldung."""
+    return (f"{column} IS NULL", ()) if raw_item_id is None else (f"{column} = %s", (raw_item_id,))
+
+
+def reconcile_matches(conn, raw_item_id: int | None, candidates: dict[tuple[int, str], Candidate],
                       not_affected: set) -> set[int]:
     """Gleicht Treffer ab und gibt die IDs wieder geoeffneter Treffer zurueck."""
     suppressed = _active_suppressions(conn)
     reopened: set[int] = set()
     wanted = {k: c for k, c in candidates.items() if k not in suppressed}
+    where, params = _of_item("raw_item_id", raw_item_id)
     existing = {(r["component_id"], r["match_key"]): r for r in conn.execute(
-        "SELECT * FROM m3.matches WHERE raw_item_id = %s FOR UPDATE", (raw_item_id,)).fetchall()}
+        f"SELECT * FROM m3.matches WHERE {where} FOR UPDATE", params).fetchall()}
 
     for key, row in existing.items():
         if key not in wanted and row["status"] == "open":
@@ -221,15 +228,22 @@ def reconcile_matches(conn, raw_item_id: int, candidates: dict[tuple[int, str], 
 # ---------------------------------------------------------------- Bewerten und belegen
 
 def _evidence(conn, assessment_id: int, item, m, fact) -> None:
-    rows = [("report", f"Meldung: {item['title']}", "raw_item", item["id"], item["url"], None)]
+    rows = []
+    if item["id"] is not None:
+        rows.append(("report", f"Meldung: {item['title']}", "raw_item", item["id"], item["url"], None))
     rule = (m["match_details"].get("rules") or [{}])[0]
     bounds = ", ".join(f"{k.replace('version_', '')}={v}" for k, v in rule.items() if k.startswith("version_"))
     version = m["match_details"].get("component_version") or "unbekannt"
+    source = "OSV" if rule.get("source") == "osv" else "NVD"
+    source_url = (OSV_URL if source == "OSV" else NVD_URL).format(m["cve_id"])
     if m["version_status"] == "affected":
-        text = f"{m['component_name']} {version} liegt im betroffenen Bereich von {m['cve_id']}" + (f" ({bounds})" if bounds else " (alle Versionen)")
+        text = (f"{m['component_name']} {version} liegt laut {source} im betroffenen Bereich von {m['cve_id']}"
+                + (f" ({bounds})" if bounds else " (alle Versionen)"))
     else:
-        text = f"{m['component_name']} ist laut NVD betroffen, Version {version} ist nicht sicher vergleichbar"
-    rows.append(("affected_version", text, "cve_affected", None, NVD_URL.format(m["cve_id"]), rule))
+        text = f"{m['component_name']} ist laut {source} betroffen, Version {version} ist nicht sicher vergleichbar"
+    if not m["is_direct"] and m.get("path_names"):
+        text += f"; enthalten in {' -> '.join(m['path_names'][:-1])}"
+    rows.append(("affected_version", text, "cve_affected", None, source_url, rule))
     rows.append(("asset", f"System {m['asset_key']} ({m['asset_name']}), Kritikalität {m['criticality']}, "
                  f"aus dem Internet erreichbar: {'ja' if m['internet_exposed'] else 'nein'}", "inventory", None, None,
                  {"asset_id": m["asset_id"], "component_id": m["component_id"]}))
@@ -258,16 +272,20 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
     """Bewertet alle offenen Treffer der Meldung. Neue Zeile nur, wenn sich Eingaben geaendert haben
     oder der Treffer wieder geoeffnet wurde (neue ID -> M4 benachrichtigt erneut)."""
     created = 0
-    matches = conn.execute("""
+    where, params = _of_item("m.raw_item_id", item["id"])
+    matches = conn.execute(f"""
         SELECT m.*, c.name AS component_name, a.id AS asset_id, a.asset_key, a.name AS asset_name,
                a.criticality, a.internet_exposed,
+               (SELECT array_agg(pc.name ORDER BY p.ord)
+                  FROM unnest(m.dependency_path) WITH ORDINALITY AS p(cid, ord)
+                  JOIN m3.sbom_components pc ON pc.id = p.cid) AS path_names,
                ra.id AS current_id, ra.risk_fingerprint AS current_fp
           FROM m3.matches m
           JOIN m3.sbom_components c ON c.id = m.component_id
           JOIN m3.assets a ON a.id = c.asset_id
           LEFT JOIN m3.risk_assessments ra ON ra.match_id = m.id AND ra.is_current
-         WHERE m.raw_item_id = %s AND m.status = 'open'
-    """, (item["id"],)).fetchall()
+         WHERE {where} AND m.status = 'open'
+    """, params).fetchall()
     for m in matches:
         fact = facts.get(m["cve_id"])
         inp = RiskInput(
@@ -283,10 +301,14 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
         )
         fp = fingerprint({"logic": config.MATCH_LOGIC_VERSION, "policy": policy.version, "input": inp.__dict__,
                           "method": m["match_method"], "category": item["category"],
-                          "trust_label": item["trust_label"]})
+                          "trust_label": item["trust_label"], "is_direct": m["is_direct"],
+                          "fixed": recommend.fixed_version(m["match_details"]), "rec": recommend.PROMPT_VERSION})
         if fp == m["current_fp"] and m["id"] not in force:
             continue
         r = score(inp, policy, now)
+        checks = recommend.manual_checks(version_status=m["version_status"], match_method=m["match_method"],
+                                         is_direct=m["is_direct"], trust_label=item["trust_label"],
+                                         cvss_score=inp.cvss_score, kev_listed=inp.kev_listed)
         if m["current_id"]:
             conn.execute("UPDATE m3.risk_assessments SET is_current=false WHERE id=%s", (m["current_id"],))
         new_id = conn.execute("""
@@ -294,14 +316,18 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
               (match_id, scoring_branch, score, risk_level, action_code, deadline_at, policy_version,
                cvss_score, cvss_version, kev_listed, kev_due_date, epss_score, asset_criticality,
                internet_exposed, match_confidence, trust_score, trust_label, category, factor_breakdown,
-               risk_fingerprint, assessed_at)
-            VALUES (%s,'cve',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+               manual_checks, risk_fingerprint, assessed_at)
+            VALUES (%s,'cve',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (m["id"], r.score, r.risk_level, r.action_code, r.deadline_at, policy.version,
              inp.cvss_score, fact["cvss_version"] if fact else None, inp.kev_listed, inp.kev_due_date,
              inp.epss_score, inp.asset_criticality, inp.internet_exposed, inp.match_confidence,
              inp.trust_score, item["trust_label"], item["category"], Jsonb(_jsonable(r.factor_breakdown)),
-             fp, now)).fetchone()["id"]
+             Jsonb(checks), fp, now)).fetchone()["id"]
         _evidence(conn, new_id, item, m, fact)
+        assessment = {"risk_level": r.risk_level, "score": r.score, "deadline_at": r.deadline_at,
+                      "kev_listed": inp.kev_listed, "kev_due_date": inp.kev_due_date, "cvss_score": inp.cvss_score,
+                      "epss_score": inp.epss_score, "trust_label": item["trust_label"]}
+        recommend.write_templates(conn, new_id, _jsonable(recommend.build_facts(m, assessment, checks)))
         created += 1
     return created
 
@@ -329,6 +355,40 @@ def process_item(conn, item, facts, policy: Policy, match_fp: str, risk_fp: str,
             attempts=0, last_error=NULL, processed_at=now()""",
         (item["id"], status, item["category"], match_fp, risk_fp))
     return status
+
+
+INVENTORY_ITEM = {"id": None, "title": None, "url": None, "category": "VULNERABILITY",
+                  "trust_score": None, "trust_label": None}
+
+
+def scan_inventory(conn, policy: Policy, now: datetime) -> int:
+    """Bekannte Schwachstellen der Inventar-Software, auch ohne Meldung. Nur sicher betroffene
+    Versionen: bei unklarer Version waere sonst jede CVE eines Produkts ein Fund.
+    Rueckgabe: Anzahl offener Inventarfunde."""
+    cves = [r["cve_id"] for r in conn.execute("""
+        SELECT DISTINCT ca.cve_id
+          FROM public.cve_affected ca
+          JOIN m3.sbom_components c ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
+          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+         WHERE ca.data_source = 'nvd'
+        UNION
+        SELECT DISTINCT ca.cve_id
+          FROM public.cve_affected ca
+          JOIN m3.sbom_components c
+            ON c.osv_ecosystem = ca.ecosystem AND c.is_active
+           AND c.osv_package = CASE WHEN ca.ecosystem = 'PyPI'
+                                    THEN lower(regexp_replace(ca.package_name, '[-_.]+', '-', 'g'))
+                                    ELSE ca.package_name END
+          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+         WHERE ca.data_source = 'osv'
+    """).fetchall()]
+    result = match_cves(conn, cves)
+    affected = {k: c for k, c in result.candidates.items() if c.version_status == "affected"}
+    reopened = reconcile_matches(conn, None, affected, result.not_affected)
+    facts, _ = load_cve_data(conn, sorted({c.cve_id for c in affected.values()}))
+    assess_matches(conn, INVENTORY_ITEM, facts, policy, now, force=reopened)
+    return conn.execute(
+        "SELECT count(*) AS n FROM m3.matches WHERE raw_item_id IS NULL AND status = 'open'").fetchone()["n"]
 
 
 def run(conn, policy: Policy) -> dict[str, int]:
@@ -367,4 +427,7 @@ def run(conn, policy: Policy) -> dict[str, int]:
                                       THEN m3.processing.attempts + 1 ELSE 1 END,
                         last_error=EXCLUDED.last_error, processed_at=now()""",
                     (it["id"], it["category"], mfp, rfp, f"{type(exc).__name__}: {exc}"[:500]))
+    with conn.transaction():
+        stats["inventory"] = scan_inventory(conn, policy, now)
+    stats.update(recommend.refine_with_llm(conn))
     return stats

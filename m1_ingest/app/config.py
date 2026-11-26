@@ -22,6 +22,7 @@ class Settings:
     translate_batch: int
     translate_max_attempts: int
     user_agent: str
+    nvd_mirror_on_start: bool
 
 
 @lru_cache
@@ -36,4 +37,5 @@ def settings() -> Settings:
         translate_batch=_int("M1_TRANSLATE_BATCH", 20),
         translate_max_attempts=_int("M1_TRANSLATE_MAX_ATTEMPTS", 3),
         user_agent=os.environ.get("M1_USER_AGENT", "ArgosAI-M1/1.0"),
+        nvd_mirror_on_start=os.environ.get("M1_NVD_MIRROR", "1").lower() not in ("0", "false", "no"),
     )

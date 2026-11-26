@@ -4,6 +4,21 @@ from datetime import date, datetime, timezone
 import psycopg
 
 
+FACTS_LOCK_ID = 41001001   # Advisory-Lock: nur ein Prozess schreibt Fakten (Dienst oder Vollimport)
+
+
+def try_lock(conn: psycopg.Connection) -> bool:
+    ok = conn.execute("SELECT pg_try_advisory_lock(%s) AS ok", (FACTS_LOCK_ID,)).fetchone()["ok"]
+    conn.commit()
+    return ok
+
+
+def unlock(conn: psycopg.Connection) -> None:
+    conn.rollback()
+    conn.execute("SELECT pg_advisory_unlock(%s)", (FACTS_LOCK_ID,))
+    conn.commit()
+
+
 def parse_ts(value: str | None) -> datetime | None:
     """ISO-Zeitstempel; ohne Zeitzone gilt UTC (so liefert NVD)."""
     if not value:
@@ -95,11 +110,12 @@ def replace_affected(conn: psycopg.Connection, cve_id: str, data_source: str,
         return False
     conn.execute("DELETE FROM cve_affected WHERE cve_id = %s AND data_source = %s",
                  (cve_id, data_source))
-    for key in unique:
-        conn.execute(
+    if unique:
+        # executemany buendelt die Zeilen (eine CVE hat oft Hunderte Produktzeilen)
+        conn.cursor().executemany(
             f"INSERT INTO cve_affected (cve_id, data_source, {cols}) "
             f"VALUES (%s, %s, {', '.join(['%s'] * len(AFFECTED_COLS))})",
-            (cve_id, data_source, *key),
+            [(cve_id, data_source, *key) for key in unique],
         )
     conn.execute("UPDATE cve_facts SET updated_at = now() WHERE cve_id = %s", (cve_id,))
     return True
@@ -107,7 +123,9 @@ def replace_affected(conn: psycopg.Connection, cve_id: str, data_source: str,
 
 def update_epss(conn: psycopg.Connection, rows: list[tuple[str, float, float]],
                 score_date: date | None) -> int:
-    """EPSS nur fuer bereits bekannte CVEs eintragen (der Feed enthaelt ~300 000 Zeilen)."""
+    """EPSS nur fuer bereits bekannte CVEs eintragen. Geschrieben wird nur, was sich merklich aendert
+    (Score, oder Perzentil um mindestens 0.01): bei voller NVD-Spiegelung sonst ~400 000 Zeilen je Tag.
+    epss_date ist damit der Stichtag des gespeicherten Werts."""
     n = 0
     for i in range(0, len(rows), 5000):
         chunk = rows[i:i + 5000]
@@ -116,6 +134,8 @@ def update_epss(conn: psycopg.Connection, rows: list[tuple[str, float, float]],
             UPDATE cve_facts f SET epss_score = v.s, epss_percentile = v.p, epss_date = %s
             FROM unnest(%s::text[], %s::numeric[], %s::numeric[]) AS v(id, s, p)
             WHERE f.cve_id = v.id
+              AND (f.epss_score IS DISTINCT FROM v.s OR f.epss_percentile IS NULL
+                   OR abs(f.epss_percentile - v.p) >= 0.01)
             """,
             (score_date, [r[0] for r in chunk], [r[1] for r in chunk], [r[2] for r in chunk]),
         )

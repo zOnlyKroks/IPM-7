@@ -5,8 +5,9 @@ Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehande
 
 > **Stand:** Datenbankschema, Schnittstelle und Kernlogik sind umgesetzt:
 > Inventar-Import (CSV), Abgleich über CVE und NVD-CPE (Wege 1 und 3), Risiko-Score, Belege, `/run`.
-> **Folgt:** SBOM-Import und purl-Abgleich (Weg 2), Abgleich ohne CVE (Wege 4 und 5), Fehlalarme,
-> Empfehlungstexte per lokalem LLM. Diese Endpunkte antworten bis dahin mit `501`.
+> Dazu: Inventarfunde ohne Meldung, SBOM-Import mit Abgleich über purl/OSV (Weg 2), Fehlalarme, Namenshinweise beim Import,
+> Handlungsempfehlungen je Zielgruppe (feste Bausteine + Einschätzung vom lokalen LLM, mit Prüfregeln und Mustertext).
+> **Folgt:** Abgleich ohne CVE (Wege 4 und 5).
 > Feedback zur Schnittstelle bitte direkt im PR, vor allem zu den Views für M4 (Abschnitt 5).
 
 ---
@@ -78,6 +79,17 @@ Konzept, nicht in den Prototyp.
 - Treffer über eine Abhängigkeit (z. B. Bibliothek in einem Docker-Image) haben `is_direct = false`
   und einen `dependency_path` vom Image bis zur betroffenen Komponente.
 - Kombinationen, die als Fehlalarm markiert sind (`m3.suppressions`), werden übersprungen.
+- **Weg 2 (SBOM):** purl-Typ -> OSV-Ökosystem (`npm`, `pypi` -> `PyPI`, `golang` -> `Go`, `maven`, `cargo` -> `crates.io`,
+  `gem` -> `RubyGems`, `nuget`, `composer` -> `Packagist`, ...). PyPI-Namen werden nach PEP 503 normalisiert.
+  **Betriebssystempakete (deb, apk, rpm) werden gespeichert, aber nicht abgeglichen:** OSV führt sie unter dem Quellpaket
+  (z. B. `openssl` statt `libssl3`) mit distributionseigenen Versionen, ein Abgleich wäre im Prototyp nicht verlässlich.
+  Von Syft geratene CPEs werden nur gespeichert, nicht abgeglichen (zu viele Fehltreffer).
+
+### Inventarfunde ohne Meldung
+Jeder `/run` gleicht zusätzlich das Inventar direkt gegen `cve_affected` (NVD und OSV) ab, auch wenn keine Meldung die CVE nennt.
+Diese Treffer haben `raw_item_id = NULL`, keinen Trust-Score (Faktor fehlt) und die Kategorie `VULNERABILITY`.
+Es zählen nur sicher betroffene Versionen. Nennt eine Meldung dieselbe CVE, entsteht dafür ein eigener Treffer, und `findings_current` blendet den Inventarfund aus.
+Die Antwort von `/run` enthält `inventory` = Anzahl offener Inventarfunde.
 
 ## 5. Ausgabe für M4 (Views, nur lesen)
 
@@ -104,14 +116,15 @@ Gleiche Spalten, aber inklusive erledigter Treffer (`status = resolved`). Für V
 | `match_method`, `confidence`, `version_status`, `is_direct` | Wie sicher der Treffer ist |
 | `risk_score` (0-100), `risk_level` | `critical`, `high`, `medium`, `low`, `info` |
 | `action_code`, `deadline_at` | Maßnahme und Frist (regelbasiert) |
+| `manual_checks` | JSON-Liste `[{"code", "text"}]`: was ein Mensch prüfen muss (leer = nichts), siehe Abschnitt 8b |
 | `factor_breakdown` | Beitrag jedes Faktors zum Score (JSON), für die Begründung in der UI |
 | `assessed_at` | Zeitpunkt der Bewertung |
-| `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` |
+| `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` (Abschnitt 8b) |
 | `evidence` | JSON-Liste der Belege: `claim_key`, `claim_text`, `source_kind`, `raw_item_id`, `source_url` |
 
-**Benachrichtigung genau einmal:** M4 merkt sich je `risk_assessment_id`, ob schon benachrichtigt wurde.
-Steigt das Risiko (z. B. CVE neu in CISA KEV), legt M3 eine **neue** Bewertung mit neuer ID an,
-und M4 benachrichtigt automatisch erneut.
+**Benachrichtigung:** Ändern sich Eingangswerte (z. B. CVE neu in CISA KEV, neuer EPSS-Wert), legt M3 eine **neue**
+Bewertung mit neuer `risk_assessment_id` an. M4 benachrichtigt je Treffer (`match_id`) beim ersten Mal und wieder,
+wenn die Risikostufe steigt (siehe `m4_api/README.md`). Inventarfunde haben `raw_item_id = NULL`.
 
 ### `m3.assets_overview`
 Für die Verwaltungsseite: Asset-Stammdaten, `active_component_count`, `open_finding_count`,
@@ -132,7 +145,8 @@ Aufrufer sind nur n8n (`/run`) und M4 (Import, Fehlalarme). M3 ist von außen ni
 | DELETE | `/suppressions/{id}` | M4 | Markierung aufheben (wird nur deaktiviert) |
 
 ### `POST /run`
-Kein Body. Antwort: `{"processed": 12, "matched": 3, "no_match": 6, "skipped": 2, "failed": 1}`.
+Kein Body. Antwort: `{"processed": 12, "matched": 3, "no_match": 6, "skipped": 2, "failed": 1, "inventory": 4,
+"llm_passed": 2, "llm_fallback": 1, "llm_unavailable": 0}` (`llm_*` siehe Abschnitt 8b).
 Ein Fehler bei einer Meldung stoppt den Lauf nicht: sie wird `failed`, `attempts + 1`, und beim nächsten Lauf erneut versucht.
 
 ### `POST /import/assets` (CSV)
@@ -166,16 +180,30 @@ Regeln:
    Eine geänderte Version wird an derselben Komponente aktualisiert, dadurch werden bestehende Treffer neu geprüft.
 4. Alles oder nichts: bei einem Fehler wird nichts gespeichert, die Antwort listet alle fehlerhaften Zeilen.
 
-Antwort: `{"assets_created", "assets_updated", "assets_deactivated", "components_created", "components_updated", "components_deactivated"}`.
+Antwort: `{"assets_created", "assets_updated", "assets_deactivated", "components_created", "components_updated", "components_deactivated", "warnings"}`.
 
-### `POST /import/sbom?asset_key=...`
-CycloneDX-JSON von Syft (`syft <image> -o cyclonedx-json`). Komponenten werden mit Eltern-Komponente
-gespeichert, damit indirekt betroffene Software gefunden wird. Dieselbe Datei (gleicher Hash) wird nicht doppelt importiert.
+`warnings` sind **Hinweise, keine Fehler**: Hersteller/Produkt ohne `cpe23`, die in den NVD-Daten nie vorkommen
+(z. B. „FortiGate“ statt `fortios`). Der Import wird trotzdem gespeichert; der Abgleich würde für diese Zeilen aber nichts finden.
+
+### `POST /import/sbom?asset_key=...&image_ref=...`
+CycloneDX-JSON von Syft (`syft <image> -o cyclonedx-json`), bis 20 MB. `image_ref` ist optional (sonst Name/Tag aus der SBOM).
+- Nur Pakete, keine Einzeldateien (`type = file` wird übersprungen); doppelte Einträge werden zusammengefasst.
+- Eltern-Komponente jedes Pakets ist das Image (`container_image`), Pfad also Image -> Paket.
+- **Schnappschuss je Asset und Image:** fehlende Pakete werden deaktiviert; neue Paketversion = neue Komponente
+  (offene Treffer der alten Version werden beim nächsten `/run` mit `component_removed` geschlossen).
+- Dieselbe Datei (gleicher SHA-256) wird nicht erneut verarbeitet (`"unchanged": true`).
+
+Antwort: `{"image_ref", "unchanged", "packages", "packages_matchable", "os_packages_not_matched", "files_skipped", "components_created", "components_updated", "components_deactivated"}`.
+Fehler: 404 (Asset unbekannt), 409 (Asset deaktiviert), 413, 415, 422 (keine CycloneDX-Datei, keine Pakete).
 
 ### `POST /suppressions`
 Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion nicht aktiv", "created_by": "analyst@..."}`.
-`match_key` steht in jedem Treffer (`cve_id` oder `raw:<raw_item_id>`). Der Treffer wird mit
-`resolved_reason = suppressed` geschlossen und beim erneuten Abgleich übersprungen.
+`match_key` steht in jedem Treffer (`cve_id` oder `raw:<raw_item_id>`). Alle offenen Treffer dieser Kombination werden
+**sofort** mit `resolved_reason = suppressed` geschlossen und beim erneuten Abgleich übersprungen.
+Antwort: `{"suppression_id", "created", "matches_resolved"}` (erneutes Markieren: `created = false`).
+
+`GET /suppressions` listet aktive Markierungen. `DELETE /suppressions/{id}` hebt eine Markierung auf (nur deaktiviert);
+der nächste `/run` gleicht wieder ab und öffnet den Treffer mit einer neuen Bewertung.
 
 ## 7. Authentifizierung und Fehler
 
@@ -189,12 +217,11 @@ Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion n
 | 200 | Erfolg |
 | 401 | `X-API-Key` fehlt oder ist falsch |
 | 404 | `asset_key` (SBOM) oder `component_id` (Fehlalarm) existiert nicht |
-| 409 | Ein `/run` oder Import läuft bereits (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
-| 413 | Datei zu groß (vorläufig 5 MB) |
+| 409 | Ein `/run`, Import oder eine Fehlalarm-Änderung läuft bereits, oder SBOM für ein deaktiviertes Asset (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
+| 413 | Datei zu groß (CSV 5 MB, SBOM 20 MB) |
 | 415 | Falscher Dateityp (kein CSV bzw. kein CycloneDX-JSON) |
 | 422 | Inhalt ungültig; Import zusätzlich mit `"errors": [{"row": 5, "field": "criticality", "message": "..."}]` |
 | 500 | Unerwarteter Fehler: allgemeine Meldung, Details nur im Log, **keine Inventardaten in der Antwort** |
-| 501 | Endpunkt noch nicht umgesetzt (SBOM-Import, Fehlalarme) |
 
 ## 8. Risiko-Score
 
@@ -213,6 +240,33 @@ Stufen: ab 80 `critical`, ab 60 `high`, ab 40 `medium`, ab 20 `low`, sonst `info
 Mindeststufe `high`, wenn die CVE in KEV steht, das System aus dem Internet erreichbar ist und die Version sicher betroffen ist.
 Frist je Stufe (24 h / 7 / 30 / 90 Tage), nie später als die KEV-Frist.
 Fehlende Werte zählen 0 und stehen in `factor_breakdown.missing`, damit die Oberfläche einen unvollständigen Score kennzeichnen kann.
+
+## 8b. Handlungsempfehlungen
+
+Je Bewertung drei Texte (`it_security`, `management`, `executive`) in `m3.recommendations`, in der View als `recommendations`.
+**Alles, was entscheidet, ist regelbasiert; das LLM formuliert nur die Einschätzung.**
+
+| Teil | Herkunft |
+|---|---|
+| Überschrift | fest je Stufe (`Sofort handeln`, `Dringend patchen`, `Patch einplanen`, ...); bei KEV „Sofort patchen – Schwachstelle wird aktiv ausgenutzt“ |
+| Maßnahmen | feste Sätze nach Regeln: Update auf die erste nicht betroffene Version, Image neu bauen (Abhängigkeit), Version prüfen, Internetzugang einschränken, Anzeichen einer Ausnutzung prüfen, ohne Fix: Herstellerhinweise/Workaround |
+| Frist, Betroffen, CVSS/EPSS/KEV | aus der Bewertung |
+| **Manuelle Prüfung nötig** | feste Sätze, auch als `manual_checks` in der View: Version nicht vergleichbar, Treffer nur über Namen, nur über Abhängigkeit betroffen, Meldung unbestätigt/widersprüchlich, kein CVSS |
+| Einschätzung (1-3 Sätze) | lokales LLM (`LLM_MODEL`, Standard `qwen2.5:7b`), sonst Mustertext |
+
+Ablauf: Jede neue Bewertung bekommt sofort Mustertexte (`validation_status = fallback_template`). Am Ende von `/run`
+lässt M3 höchstens `M3_LLM_LIMIT` (10) sichtbare Treffer der Stufen `M3_LLM_LEVELS` (`critical,high,medium`) vom LLM
+formulieren, höchste Punktzahl zuerst; Timeout `M3_LLM_TIMEOUT` (60 s). Ist Ollama nicht erreichbar, bleiben die
+Mustertexte (`validation_errors = ["llm_unavailable"]`) und der nächste `/run` versucht es erneut.
+Ausschalten: `M3_LLM_ENABLED=false`.
+
+Das LLM bekommt nur ein festes Faktenpaket (`fact_package`, gespeichert) und **keinen Freitext aus Meldungen**
+(Schutz vor Prompt-Injection). Die Antwort wird verworfen (Mustertext, Fehler in `validation_errors`), wenn sie
+- kein JSON mit allen drei Texten ist oder zu lang ist,
+- eine CVE, Zahl, Version oder ein Datum enthält, das nicht im Faktenpaket steht,
+- einen Link enthält,
+- aktive Ausnutzung behauptet, obwohl die CVE nicht in KEV steht, oder „kritisch“ schreibt, obwohl die Stufe niedriger ist.
+Eine abgelehnte Antwort wird nicht erneut angefragt; eine neue Bewertung startet den Ablauf neu.
 
 ## 9. Neubewertung und Lebenszyklus
 
@@ -244,7 +298,7 @@ geändert -> neuer Abgleich ergibt „nicht betroffen“ -> Treffer `resolved` m
 
 - Inventar, Software und SBOMs liegen nur in der lokalen Datenbank.
 - M3 ruft **keine externen Dienste** auf. Alle externen Informationen kommen bereits aufbereitet von M1.
-- Für Empfehlungstexte (PR 4) wird nur das lokale Ollama genutzt, und das Modell erhält nur ein festes
+- Für Empfehlungstexte (Abschnitt 8b) wird nur das lokale Ollama genutzt, und das Modell erhält nur ein festes
   Faktenpaket. Maßnahme und Frist berechnet M3 regelbasiert, das LLM formuliert nur.
 - Fehlermeldungen enthalten keine Inventardaten.
 
@@ -291,13 +345,18 @@ M3_TEST_DATABASE_URL=postgresql://argos:argos@localhost:5432/argos python -m pyt
 Der Durchlauf mit DB nutzt synthetische Daten (`CVE-2099-*`, `example.invalid`) und **leert alle Tabellen in `m3`**:
 nur gegen die lokale Entwicklungsdatenbank laufen lassen. Geprüft werden u. a.: Import und Fehlerliste,
 Treffer und Nicht-Treffer nach Version, Neubewertung bei KEV-Änderung (neue `risk_assessment_id`),
-Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409.
+Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409,
+Inventarfunde ohne Meldung, Namenshinweise, Fehlalarm markieren und aufheben,
+SBOM-Import (`tests/test_sbom_integration.py`): purl/OSV-Treffer mit Pfad, PyPI-Namen, deb nicht abgeglichen, neue SBOM-Version,
+Empfehlungen (`tests/test_recommend.py`, Ollama simuliert): feste Bausteine, manuelle Prüfung, jede Prüfregel,
+kein Meldungstext im Faktenpaket, Ollama nicht erreichbar, abgelehnte Antwort -> Mustertext.
 
 ## 13. Offene Punkte
 
 | An | Frage / Hinweis |
 |---|---|
-| M4 | Passen CSV-Format, die drei Views und `/suppressions`? Sollen Entwarnungen (`resolved`) auch benachrichtigt werden? |
+| M4 | Inventarfunde haben `raw_item_id = NULL`: `m4.notification_log.raw_item_id` und `item_status` setzen bisher eine Meldung voraus. Vorschlag: Inventarfunde nur ab `high` oder bei KEV sofort melden, den Rest nur in Übersicht/Bericht. |
+| M1 | OSV-Daten gibt es bisher nur für CVEs aus Meldungen. Damit der SBOM-Abgleich (Weg 2) auch ohne Meldung viel findet, bräuchte es OSV-Daten für die Pakete aus den SBOMs (z. B. OSV-Batch-Abfrage je purl). |
 | M2 | Hinweis: Ältere Meldungen bekommen kein neues Trust-Score, wenn spätere Quellen sie bestätigen. M3 würde eine Aktualisierung automatisch übernehmen. |
 | M2 | Hinweis: `entities.version_text` wird bisher nicht befüllt, daher ist der Ersatzweg ohne CVE nur auf Produktebene möglich. |
 | M1 | Ab wann gibt es echte Daten? Bis dahin testet M3 mit synthetischen Daten. |

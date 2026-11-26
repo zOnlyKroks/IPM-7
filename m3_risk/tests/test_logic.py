@@ -1,4 +1,4 @@
-﻿"""Unit-Tests ohne Datenbank: Normalisierung, Versionsvergleich, Risiko-Score, CSV-Pruefung.
+"""Unit-Tests ohne Datenbank: Normalisierung, Versionsvergleich, Risiko-Score, CSV-Pruefung.
 Start (im Ordner m3_risk):  python -m pytest tests
 """
 from __future__ import annotations
@@ -235,3 +235,45 @@ def test_csv_header_errors():
         parse_csv(b"asset_key,name,typo\nfw-01,x,y\n")
     msg = " ".join(e["message"] for e in exc.value.errors)
     assert "Pflichtspalten fehlen" in msg and "Unbekannte Spalten" in msg
+
+
+# ---------------------------------------------------------------- SBOM / purl
+
+from app import sbom  # noqa: E402
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "sbom_small.cdx.json"
+
+
+@pytest.mark.parametrize("purl, expected", [
+    ("pkg:npm/axios@1.6.0", ("npm", "axios")),
+    ("pkg:npm/%40acme/tools@2.0.0", ("npm", "@acme/tools")),
+    ("pkg:pypi/Django_Rest.Framework@3.0", ("PyPI", "django-rest-framework")),
+    ("pkg:golang/golang.org/x/net@v0.17.0", ("Go", "golang.org/x/net")),
+    ("pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", ("Maven", "org.apache.logging.log4j:log4j-core")),
+    ("pkg:deb/debian/libssl3@3.0.11-1?distro=debian-12", None),      # Betriebssystempaket: nicht abgleichen
+])
+def test_osv_key(purl, expected):
+    assert sbom.osv_key(sbom.parse_purl(purl)) == expected
+
+
+def test_parse_purl_version_and_qualifiers():
+    p = sbom.parse_purl("pkg:deb/debian/libssl3@3.0.11-1?arch=amd64&distro=debian-12#sub")
+    assert (p.type, p.namespace, p.name, p.version) == ("deb", "debian", "libssl3", "3.0.11-1")
+    assert sbom.parse_purl("not-a-purl") is None
+
+
+def test_parse_cyclonedx_fixture():
+    parsed = sbom.parse_cyclonedx(FIXTURE.read_bytes())
+    names = [p["name"] for p in parsed.packages]
+    assert names.count("axios") == 1                        # Duplikat entfernt
+    assert "/usr/lib/libssl.so.3" not in names and parsed.skipped_files == 1
+    assert parsed.matchable == 4 and parsed.os_packages == 1
+    assert sbom.default_image_ref(parsed) == "example/webapp:1.0"
+    django = next(p for p in parsed.packages if p["name"] == "Django")
+    assert (django["osv_ecosystem"], django["osv_package"]) == ("PyPI", "django")
+
+
+@pytest.mark.parametrize("data", [b"{not json", b'{"bomFormat": "SPDX"}', b'{"bomFormat": "CycloneDX", "components": []}'])
+def test_parse_cyclonedx_rejects_invalid(data):
+    with pytest.raises(sbom.SbomError):
+        sbom.parse_cyclonedx(data)
