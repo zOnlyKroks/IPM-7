@@ -25,7 +25,7 @@ from psycopg.types.json import Jsonb
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 LOG = logging.getLogger("argos.m2")
 
-app = FastAPI(title="M2 KI-Analyse und Quellenbewertung", version="1.2.0")
+app = FastAPI(title="M2 KI-Analyse und Quellenbewertung", version="1.3.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://argos:argos@postgres:5432/argos")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
@@ -34,6 +34,9 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key")
 EMBED_DIM = 1024  # SQL vector(1024)
 BATCH_SIZE = max(1, min(int(os.getenv("M2_BATCH_SIZE", "5")), 30))
+MAX_RETRIES = max(1, int(os.getenv("M2_MAX_RETRIES", "5")))
+RETRY_BASE_SECONDS = max(10, int(os.getenv("M2_RETRY_BASE_SECONDS", "60")))
+RETRY_MAX_SECONDS = max(RETRY_BASE_SECONDS, int(os.getenv("M2_RETRY_MAX_SECONDS", "3600")))
 CHUNK_CHARS = max(300, int(os.getenv("M2_CHUNK_CHARS", "1300")))
 MAX_CHUNKS = max(1, min(int(os.getenv("M2_MAX_CHUNKS", "6")), 20))
 MAX_ARTICLE_CHARS = max(1000, int(os.getenv("M2_MAX_ARTICLE_CHARS", "12000")))
@@ -214,10 +217,35 @@ def load_unprocessed(conn: psycopg.Connection, limit: int) -> list[dict[str, Any
                s.source_type, s.is_primary_source, s.trust_weight
         FROM public.raw_items AS r
         JOIN public.sources AS s ON s.id = r.source_id
+        LEFT JOIN m2.processing_failures AS f ON f.raw_item_id = r.id
         WHERE r.translation_status <> 'pending'
           AND NOT EXISTS (SELECT 1 FROM m2.summaries AS x WHERE x.raw_item_id = r.id)
+          AND (f.raw_item_id IS NULL OR (f.attempts < %s AND f.next_retry_at <= now()))
         ORDER BY r.id ASC LIMIT %s
-    """, (limit,)).fetchall()
+    """, (MAX_RETRIES, limit)).fetchall()
+
+
+def record_processing_failure(conn: psycopg.Connection, raw_item_id: int, exc: Exception) -> None:
+    """Record errors AFTER rolling back the article transaction.
+
+    A failing article is retried with exponential backoff; after MAX_RETRIES
+    attempts it is quarantined until somebody resets the failure record.
+    """
+    reason = f"{type(exc).__name__}: {exc}"[:1000]
+    conn.execute("""
+        INSERT INTO m2.processing_failures
+            (raw_item_id, attempts, last_error, last_failed_at, next_retry_at)
+        VALUES (%s, 1, %s, now(), now() + (%s * interval '1 second'))
+        ON CONFLICT (raw_item_id) DO UPDATE SET
+            attempts = m2.processing_failures.attempts + 1,
+            last_error = EXCLUDED.last_error,
+            last_failed_at = now(),
+            next_retry_at = now() + (
+                LEAST(%s, %s * power(2.0, LEAST(m2.processing_failures.attempts, 30)))
+                * interval '1 second'
+            )
+    """, (raw_item_id, reason, RETRY_BASE_SECONDS,
+          RETRY_MAX_SECONDS, RETRY_BASE_SECONDS))
 
 
 def article_input_type(item: dict[str, Any]) -> str:
@@ -379,21 +407,35 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
 
 def link_related_events(conn: psycopg.Connection, event_id: Any, item: dict[str, Any], vec: str) -> None:
     """Optional evidence-backed relationships. Temporal order never implies causation."""
+    # First pick the strongest supporting article for EACH event, then globally
+    # rank events by semantic similarity. DISTINCT ON (event ID) with LIMIT in
+    # the outer query used to prefer low UUIDs instead of high similarity.
     peers = conn.execute("""
-        SELECT DISTINCT ON (ev.id)
-               ev.id, ev.occurred_start_at, other_item.id AS evidence_item,
-               1 - (ee.embedding <=> %s::vector) AS similarity
-        FROM m2.events ev
-        JOIN m2.event_embeddings ee ON ee.event_id=ev.id
-        JOIN m2.event_members em ON em.event_id=ev.id
-        JOIN public.raw_items other_item ON other_item.id=em.raw_item_id
-        JOIN m2.entities oe ON oe.raw_item_id=other_item.id
-        JOIN m2.entities ne ON ne.raw_item_id=%s
-            AND ne.entity_type=oe.entity_type
-            AND ne.entity_type IN ('VENDOR','PRODUCT')
-            AND ne.normalized_name=oe.normalized_name
-        WHERE ev.id<>%s AND ee.embedding_model=%s AND ee.narrative_hash=ev.narrative_hash
-        ORDER BY ev.id, similarity DESC LIMIT 20
+        WITH event_candidates AS (
+            SELECT ev.id, ev.occurred_start_at,
+                   other_item.id AS evidence_item,
+                   1 - (ee.embedding <=> %s::vector) AS similarity,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ev.id
+                       ORDER BY other_item.id
+                   ) AS evidence_rank
+            FROM m2.events ev
+            JOIN m2.event_embeddings ee ON ee.event_id=ev.id
+            JOIN m2.event_members em ON em.event_id=ev.id
+            JOIN public.raw_items other_item ON other_item.id=em.raw_item_id
+            JOIN m2.entities oe ON oe.raw_item_id=other_item.id
+            JOIN m2.entities ne ON ne.raw_item_id=%s
+                AND ne.entity_type=oe.entity_type
+                AND ne.entity_type IN ('VENDOR','PRODUCT')
+                AND ne.normalized_name=oe.normalized_name
+            WHERE ev.id<>%s AND ee.embedding_model=%s
+              AND ee.narrative_hash=ev.narrative_hash
+        )
+        SELECT id, occurred_start_at, evidence_item, similarity
+        FROM event_candidates
+        WHERE evidence_rank = 1
+        ORDER BY similarity DESC, id
+        LIMIT 20
     """, (vec, item["id"], event_id, EMBED_MODEL)).fetchall()
     current_date_row = conn.execute("SELECT occurred_start_at FROM m2.events WHERE id=%s", (event_id,)).fetchone()
     current_date = current_date_row["occurred_start_at"]
@@ -450,7 +492,7 @@ def find_relations_and_score(conn: psycopg.Connection, item: dict[str, Any], clu
             JOIN public.raw_items r ON r.id=cm.raw_item_id
             JOIN m2.summaries s ON s.raw_item_id=r.id
             WHERE cm.cluster_id=%s AND r.id<>%s
-            ORDER BY r.id LIMIT 30
+            ORDER BY r.id
         """, (cid, item["id"])).fetchall()
         for old in other:
             for current_claim in claims:
@@ -545,6 +587,40 @@ def save_trust(conn: psycopg.Connection, item: dict[str, Any], corroboration: fl
           "Regelbasierte Bewertung von Quelle, Bestätigungen, Primärquelle, Aktualität und Widerspruch."))
 
 
+def refresh_related_trust(conn: psycopg.Connection, current_raw_item_id: int,
+                          cluster_ids: list[str]) -> int:
+    """Re-evaluate already scored items sharing at least one affected cluster.
+
+    This is synchronous for consistency in the MVP; large clusters should move
+    to a dedicated rescore queue in a later revision.
+    """
+    affected = conn.execute("""
+        SELECT DISTINCT r.id, r.source_id, r.title, r.body, r.title_de, r.body_de,
+               r.cve_ids, r.published_at, r.fetched_at, r.translation_status,
+               r.content_hash, src.source_type, src.is_primary_source,
+               src.trust_weight, s.key_claims
+        FROM m2.cluster_members cm
+        JOIN public.raw_items r ON r.id=cm.raw_item_id
+        JOIN public.sources src ON src.id=r.source_id
+        JOIN m2.summaries s ON s.raw_item_id=r.id
+        JOIN m2.trust_scores ts ON ts.raw_item_id=r.id
+        WHERE cm.cluster_id=ANY(%s::uuid[]) AND r.id<>%s
+        ORDER BY r.id
+    """, (list(dict.fromkeys(cluster_ids)), current_raw_item_id)).fetchall()
+    count = 0
+    for old in affected:
+        peer_clusters = conn.execute("""
+            SELECT cluster_id FROM m2.cluster_members WHERE raw_item_id=%s
+        """, (old["id"],)).fetchall()
+        original_claims = old["key_claims"] if isinstance(old["key_claims"], list) else []
+        corroboration, contradiction, _ = find_relations_and_score(
+            conn, old, [str(row["cluster_id"]) for row in peer_clusters], original_claims
+        )
+        save_trust(conn, old, corroboration, contradiction)
+        count += 1
+    return count
+
+
 def process_item(conn: psycopg.Connection, item: dict[str, Any]) -> dict[str, Any]:
     title = item["title_de"] or item["title"]
     body = item["body_de"] if item["body_de"] is not None else item["body"]
@@ -597,7 +673,11 @@ def process_item(conn: psycopg.Connection, item: dict[str, Any]) -> dict[str, An
     event_id = attach_event(conn, item, full_vec, parsed["summary"], parsed["category"], parsed["timeline"], clusters_ids)
     corroboration, contradiction, _ = find_relations_and_score(conn, item, clusters_ids, claims)
     save_trust(conn, item, corroboration, contradiction)
-    return {"raw_item_id": item["id"], "entities": len(entities), "clusters": len(clusters_ids), "event_id": event_id}
+    # New independent evidence may change scores assigned to already-processed
+    # news. Recompute affected older reports in the same DB transaction.
+    updated_scores = refresh_related_trust(conn, item["id"], clusters_ids)
+    return {"raw_item_id": item["id"], "entities": len(entities), "clusters": len(clusters_ids),
+            "event_id": event_id, "rescored_reports": updated_scores}
 
 
 @app.get("/health")
@@ -625,11 +705,19 @@ def run() -> dict[str, Any]:
                 for item in candidates:
                     try:
                         result = process_item(conn, item)
+                        conn.execute("DELETE FROM m2.processing_failures WHERE raw_item_id=%s", (item["id"],))
                         conn.commit()  # commit all m2.* rows together, only after success
                         completed.append(result)
                     except Exception as exc:
-                        conn.rollback()  # retry next /run; no partial results
+                        conn.rollback()  # no partial M2 results
                         LOG.exception("M2 failed for raw_item_id=%s", item["id"])
+                        try:
+                            record_processing_failure(conn, item["id"], exc)
+                            conn.commit()  # keep the failure after rolling back analysis
+                        except Exception:
+                            conn.rollback()
+                            LOG.exception("Could not record M2 failure for raw_item_id=%s", item["id"])
+                            raise
                         errors.append({"raw_item_id": item["id"], "error": type(exc).__name__})
             finally:
                 conn.rollback()  # no open transaction when unlocking
@@ -637,7 +725,7 @@ def run() -> dict[str, Any]:
                 conn.commit()
         return {"processed": len(completed), "failed": len(errors),
                 "items": completed, "errors": errors,
-                "note": "Prototype; failed items remain pending and can be retried."}
+                "note": "Failures are retried with backoff and quarantined after M2_MAX_RETRIES attempts."}
     finally:
         RUN_MUTEX.release()
 
