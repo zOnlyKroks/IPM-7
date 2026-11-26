@@ -15,6 +15,8 @@ veroeffentlicht `init.sh` den Workflow.
 | `m1_fetch_due.json` | jede Minute | `POST m1:8000/fetch/due`: faellige Quellen abrufen (Intervall je Quelle: `sources.fetch_interval_minutes`) |
 | `m1_fetch_priority.json` | alle 5 Minuten | `POST m1:8000/fetch/priority`: Eilmeldungs-Lauf aller Quellen mit `is_priority` |
 | `m1_translate.json` | alle 2 Minuten | `POST m1:8000/translate`: ausstehende Meldungen uebersetzen |
+| `m2_analyze.json` | alle 5 Minuten | `POST m2:8000/run`: bis zu `M2_BATCH_SIZE` (Standard 5) uebersetzte Meldungen analysieren |
+| `m3_assess.json` | alle 5 Minuten | `POST m3:8000/run`: neue oder geaenderte Meldungen mit dem Inventar abgleichen und bewerten |
 
 Die Aufrufe senden `X-API-Key: $INTERNAL_API_KEY` (die Variable kennt n8n aus `docker-compose.yml`).
 Laeuft ein Aufruf noch, wenn der naechste kommt, ueberspringt M1 die betroffene Quelle bzw. den

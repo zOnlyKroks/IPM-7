@@ -1,0 +1,51 @@
+{
+  "id": "m2Analyze000001",
+  "name": "M2 - Meldungen analysieren (alle 5 Minuten)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [ { "field": "minutes", "minutesInterval": 5 } ] }
+      },
+      "id": "d1000000-0000-4000-8000-000000000001",
+      "name": "Zeitplan: alle 5 Minuten",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [ 0, 0 ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://m2:8000/run",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "X-API-Key", "value": "={{ $env.INTERNAL_API_KEY }}" } ] },
+        "options": {
+          "timeout": 3600000,
+          "response": { "response": { "fullResponse": true, "neverError": true } }
+        }
+      },
+      "id": "d1000000-0000-4000-8000-000000000002",
+      "name": "M2: offene Meldungen analysieren",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ 240, 0 ],
+      "notes": "POST /run: Zusammenfassung, Entitaeten, Embeddings, Cluster und Trust-Score fuer bis zu M2_BATCH_SIZE Meldungen. Mit lokalem LLM dauert ein Lauf mehrere Minuten.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\n// 409: der vorige Lauf arbeitet noch, das ist kein Fehler.\nif (r.statusCode === 409) return [{ json: { skipped: 'M2 laeuft noch' } }];\nif (r.statusCode >= 400) throw new Error('M2 /run HTTP ' + r.statusCode + ': ' + JSON.stringify(r.body));\nreturn [{ json: r.body }];"
+      },
+      "id": "d1000000-0000-4000-8000-000000000003",
+      "name": "Ergebnis pruefen (409 = laeuft noch)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 480, 0 ]
+    }
+  ],
+  "connections": {
+    "Zeitplan: alle 5 Minuten": { "main": [ [ { "node": "M2: offene Meldungen analysieren", "type": "main", "index": 0 } ] ] },
+    "M2: offene Meldungen analysieren": { "main": [ [ { "node": "Ergebnis pruefen (409 = laeuft noch)", "type": "main", "index": 0 } ] ] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
