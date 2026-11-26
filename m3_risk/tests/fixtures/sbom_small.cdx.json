@@ -1,0 +1,19 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "metadata": {
+    "component": {"type": "container", "name": "example/webapp", "version": "1.0", "bom-ref": "img"}
+  },
+  "components": [
+    {"type": "library", "name": "axios", "version": "1.6.0", "purl": "pkg:npm/axios@1.6.0",
+     "cpe": "cpe:2.3:a:axios:axios:1.6.0:*:*:*:*:*:*:*"},
+    {"type": "library", "name": "axios", "version": "1.6.0", "purl": "pkg:npm/axios@1.6.0"},
+    {"type": "library", "name": "@acme/tools", "version": "2.0.0", "purl": "pkg:npm/%40acme/tools@2.0.0"},
+    {"type": "library", "name": "Django", "version": "4.2.0", "purl": "pkg:pypi/django@4.2.0"},
+    {"type": "library", "name": "golang.org/x/net", "version": "v0.17.0", "purl": "pkg:golang/golang.org/x/net@v0.17.0"},
+    {"type": "library", "name": "libssl3", "version": "3.0.11-1",
+     "purl": "pkg:deb/debian/libssl3@3.0.11-1?arch=amd64&distro=debian-12"},
+    {"type": "operating-system", "name": "debian", "version": "12"},
+    {"type": "file", "name": "/usr/lib/libssl.so.3"}
+  ]
+}

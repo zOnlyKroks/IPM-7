@@ -25,6 +25,7 @@ log = logging.getLogger("m3.pipeline")
 
 CVE_CATEGORIES = {"VULNERABILITY", "ATTACK"}
 NVD_URL = "https://nvd.nist.gov/vuln/detail/{}"
+OSV_URL = "https://osv.dev/vulnerability/{}"
 KEV_URL = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
 EPSS_URL = "https://www.first.org/epss/"
 
@@ -233,11 +234,16 @@ def _evidence(conn, assessment_id: int, item, m, fact) -> None:
     rule = (m["match_details"].get("rules") or [{}])[0]
     bounds = ", ".join(f"{k.replace('version_', '')}={v}" for k, v in rule.items() if k.startswith("version_"))
     version = m["match_details"].get("component_version") or "unbekannt"
+    source = "OSV" if rule.get("source") == "osv" else "NVD"
+    source_url = (OSV_URL if source == "OSV" else NVD_URL).format(m["cve_id"])
     if m["version_status"] == "affected":
-        text = f"{m['component_name']} {version} liegt im betroffenen Bereich von {m['cve_id']}" + (f" ({bounds})" if bounds else " (alle Versionen)")
+        text = (f"{m['component_name']} {version} liegt laut {source} im betroffenen Bereich von {m['cve_id']}"
+                + (f" ({bounds})" if bounds else " (alle Versionen)"))
     else:
-        text = f"{m['component_name']} ist laut NVD betroffen, Version {version} ist nicht sicher vergleichbar"
-    rows.append(("affected_version", text, "cve_affected", None, NVD_URL.format(m["cve_id"]), rule))
+        text = f"{m['component_name']} ist laut {source} betroffen, Version {version} ist nicht sicher vergleichbar"
+    if not m["is_direct"] and m.get("path_names"):
+        text += f"; enthalten in {' -> '.join(m['path_names'][:-1])}"
+    rows.append(("affected_version", text, "cve_affected", None, source_url, rule))
     rows.append(("asset", f"System {m['asset_key']} ({m['asset_name']}), Kritikalität {m['criticality']}, "
                  f"aus dem Internet erreichbar: {'ja' if m['internet_exposed'] else 'nein'}", "inventory", None, None,
                  {"asset_id": m["asset_id"], "component_id": m["component_id"]}))
@@ -270,6 +276,9 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
     matches = conn.execute(f"""
         SELECT m.*, c.name AS component_name, a.id AS asset_id, a.asset_key, a.name AS asset_name,
                a.criticality, a.internet_exposed,
+               (SELECT array_agg(pc.name ORDER BY p.ord)
+                  FROM unnest(m.dependency_path) WITH ORDINALITY AS p(cid, ord)
+                  JOIN m3.sbom_components pc ON pc.id = p.cid) AS path_names,
                ra.id AS current_id, ra.risk_fingerprint AS current_fp
           FROM m3.matches m
           JOIN m3.sbom_components c ON c.id = m.component_id
@@ -354,6 +363,16 @@ def scan_inventory(conn, policy: Policy, now: datetime) -> int:
           JOIN m3.sbom_components c ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
           JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
          WHERE ca.data_source = 'nvd'
+        UNION
+        SELECT DISTINCT ca.cve_id
+          FROM public.cve_affected ca
+          JOIN m3.sbom_components c
+            ON c.osv_ecosystem = ca.ecosystem AND c.is_active
+           AND c.osv_package = CASE WHEN ca.ecosystem = 'PyPI'
+                                    THEN lower(regexp_replace(ca.package_name, '[-_.]+', '-', 'g'))
+                                    ELSE ca.package_name END
+          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+         WHERE ca.data_source = 'osv'
     """).fetchall()]
     result = match_cves(conn, cves)
     affected = {k: c for k, c in result.candidates.items() if c.version_status == "affected"}

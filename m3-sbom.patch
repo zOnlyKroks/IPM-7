@@ -1,0 +1,1104 @@
+From d91d0a44ae5e6c925206dd6e844238013370ee47 Mon Sep 17 00:00:00 2001
+From: IsanaNao <18001641221@163.com>
+Date: Thu, 26 Nov 2026 20:16:38 +0100
+Subject: [PATCH] M3: SBOM-Import mit purl/OSV-Abgleich, Fehlalarme,
+ Namenshinweise
+
+- POST /import/sbom: CycloneDX (Syft), Schnappschuss je Asset und Image,
+  Image als Eltern-Komponente, OS-Pakete gespeichert aber nicht abgeglichen
+- Abgleich Weg 2 (purl_version) ueber OSV, auch im Inventarabgleich ohne Meldung
+- GET/POST/DELETE /suppressions, offene Treffer werden sofort geschlossen
+- /import/assets liefert warnings fuer Produktnamen, die NVD nicht kennt
+- Tests: 87 (neu: test_sbom_integration.py), README aktualisiert
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ab6giZjQxQSk46k4kfLQHp
+---
+ db/init/m3_initial.sql                     |   3 +
+ m3_risk/README.md                          |  55 ++++--
+ m3_risk/app/config.py                      |   1 +
+ m3_risk/app/inventory.py                   |  29 ++-
+ m3_risk/app/main.py                        |  87 ++++++++-
+ m3_risk/app/matching.py                    |  89 ++++++---
+ m3_risk/app/pipeline.py                    |  25 ++-
+ m3_risk/app/sbom.py                        | 206 +++++++++++++++++++++
+ m3_risk/tests/fixtures/sbom_small.cdx.json |  19 ++
+ m3_risk/tests/test_integration.py          |  94 +++++++++-
+ m3_risk/tests/test_logic.py                |  44 ++++-
+ m3_risk/tests/test_sbom_integration.py     | 133 +++++++++++++
+ 12 files changed, 727 insertions(+), 58 deletions(-)
+ create mode 100644 m3_risk/app/sbom.py
+ create mode 100644 m3_risk/tests/fixtures/sbom_small.cdx.json
+ create mode 100644 m3_risk/tests/test_sbom_integration.py
+
+diff --git a/db/init/m3_initial.sql b/db/init/m3_initial.sql
+index f0f80de..4d6432a 100644
+--- a/db/init/m3_initial.sql
++++ b/db/init/m3_initial.sql
+@@ -84,6 +84,8 @@ CREATE TABLE m3.sbom_components (
+     vendor_country      text        CHECK (vendor_country ~ '^[A-Z]{2}$'),      -- ISO 3166-1 alpha-2, fuer vendor_exposure
+     cpe23               text        CHECK (cpe23 LIKE 'cpe:2.3:%'),
+     purl                text        CHECK (purl LIKE 'pkg:%'),
++    osv_ecosystem       text,                                                   -- aus der purl abgeleitet, z. B. "npm", "PyPI", "Go"
++    osv_package         text,                                                   -- Paketname wie in OSV (PyPI normalisiert); NULL = nicht abgleichbar (z. B. deb/apk)
+     image_ref           text,                                                   -- nur sbom, z. B. "n8nio/n8n:1.70.1"
+     sbom_sha256         text        CHECK (sbom_sha256 ~ '^[0-9a-f]{64}$'),     -- nur sbom
+     is_active           boolean     NOT NULL DEFAULT true,
+@@ -112,6 +114,7 @@ CREATE INDEX sbom_components_asset_idx          ON m3.sbom_components (asset_id)
+ CREATE INDEX sbom_components_parent_idx         ON m3.sbom_components (parent_component_id);
+ CREATE INDEX sbom_components_vendor_product_idx ON m3.sbom_components (vendor_norm, product_norm);
+ CREATE INDEX sbom_components_purl_idx           ON m3.sbom_components (purl);
++CREATE INDEX sbom_components_osv_idx            ON m3.sbom_components (osv_ecosystem, osv_package) WHERE is_active;
+ 
+ CREATE TRIGGER sbom_components_touch_updated_at BEFORE UPDATE ON m3.sbom_components
+     FOR EACH ROW EXECUTE FUNCTION m3.touch_updated_at();
+diff --git a/m3_risk/README.md b/m3_risk/README.md
+index 9b4a42e..f1471f7 100644
+--- a/m3_risk/README.md
++++ b/m3_risk/README.md
+@@ -5,8 +5,8 @@ Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehande
+ 
+ > **Stand:** Datenbankschema, Schnittstelle und Kernlogik sind umgesetzt:
+ > Inventar-Import (CSV), Abgleich über CVE und NVD-CPE (Wege 1 und 3), Risiko-Score, Belege, `/run`.
+-> **Folgt:** SBOM-Import und purl-Abgleich (Weg 2), Abgleich ohne CVE (Wege 4 und 5), Fehlalarme,
+-> Empfehlungstexte per lokalem LLM. Diese Endpunkte antworten bis dahin mit `501`.
++> Dazu: Inventarfunde ohne Meldung, SBOM-Import mit Abgleich über purl/OSV (Weg 2), Fehlalarme, Namenshinweise beim Import.
++> **Folgt:** Abgleich ohne CVE (Wege 4 und 5), Empfehlungstexte per lokalem LLM.
+ > Feedback zur Schnittstelle bitte direkt im PR, vor allem zu den Views für M4 (Abschnitt 5).
+ 
+ ---
+@@ -78,9 +78,14 @@ Konzept, nicht in den Prototyp.
+ - Treffer über eine Abhängigkeit (z. B. Bibliothek in einem Docker-Image) haben `is_direct = false`
+   und einen `dependency_path` vom Image bis zur betroffenen Komponente.
+ - Kombinationen, die als Fehlalarm markiert sind (`m3.suppressions`), werden übersprungen.
++- **Weg 2 (SBOM):** purl-Typ -> OSV-Ökosystem (`npm`, `pypi` -> `PyPI`, `golang` -> `Go`, `maven`, `cargo` -> `crates.io`,
++  `gem` -> `RubyGems`, `nuget`, `composer` -> `Packagist`, ...). PyPI-Namen werden nach PEP 503 normalisiert.
++  **Betriebssystempakete (deb, apk, rpm) werden gespeichert, aber nicht abgeglichen:** OSV führt sie unter dem Quellpaket
++  (z. B. `openssl` statt `libssl3`) mit distributionseigenen Versionen, ein Abgleich wäre im Prototyp nicht verlässlich.
++  Von Syft geratene CPEs werden nur gespeichert, nicht abgeglichen (zu viele Fehltreffer).
+ 
+ ### Inventarfunde ohne Meldung
+-Jeder `/run` gleicht zusätzlich das Inventar direkt gegen `cve_affected` (NVD) ab, auch wenn keine Meldung die CVE nennt.
++Jeder `/run` gleicht zusätzlich das Inventar direkt gegen `cve_affected` (NVD und OSV) ab, auch wenn keine Meldung die CVE nennt.
+ Diese Treffer haben `raw_item_id = NULL`, keinen Trust-Score (Faktor fehlt) und die Kategorie `VULNERABILITY`.
+ Es zählen nur sicher betroffene Versionen. Nennt eine Meldung dieselbe CVE, entsteht dafür ein eigener Treffer, und `findings_current` blendet den Inventarfund aus.
+ Die Antwort von `/run` enthält `inventory` = Anzahl offener Inventarfunde.
+@@ -115,9 +120,9 @@ Gleiche Spalten, aber inklusive erledigter Treffer (`status = resolved`). Für V
+ | `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` |
+ | `evidence` | JSON-Liste der Belege: `claim_key`, `claim_text`, `source_kind`, `raw_item_id`, `source_url` |
+ 
+-**Benachrichtigung genau einmal:** M4 merkt sich je `risk_assessment_id`, ob schon benachrichtigt wurde.
+-Steigt das Risiko (z. B. CVE neu in CISA KEV), legt M3 eine **neue** Bewertung mit neuer ID an,
+-und M4 benachrichtigt automatisch erneut.
++**Benachrichtigung:** Ändern sich Eingangswerte (z. B. CVE neu in CISA KEV, neuer EPSS-Wert), legt M3 eine **neue**
++Bewertung mit neuer `risk_assessment_id` an. M4 benachrichtigt je Treffer (`match_id`) beim ersten Mal und wieder,
++wenn die Risikostufe steigt (siehe `m4_api/README.md`). Inventarfunde haben `raw_item_id = NULL`.
+ 
+ ### `m3.assets_overview`
+ Für die Verwaltungsseite: Asset-Stammdaten, `active_component_count`, `open_finding_count`,
+@@ -172,16 +177,30 @@ Regeln:
+    Eine geänderte Version wird an derselben Komponente aktualisiert, dadurch werden bestehende Treffer neu geprüft.
+ 4. Alles oder nichts: bei einem Fehler wird nichts gespeichert, die Antwort listet alle fehlerhaften Zeilen.
+ 
+-Antwort: `{"assets_created", "assets_updated", "assets_deactivated", "components_created", "components_updated", "components_deactivated"}`.
++Antwort: `{"assets_created", "assets_updated", "assets_deactivated", "components_created", "components_updated", "components_deactivated", "warnings"}`.
+ 
+-### `POST /import/sbom?asset_key=...`
+-CycloneDX-JSON von Syft (`syft <image> -o cyclonedx-json`). Komponenten werden mit Eltern-Komponente
+-gespeichert, damit indirekt betroffene Software gefunden wird. Dieselbe Datei (gleicher Hash) wird nicht doppelt importiert.
++`warnings` sind **Hinweise, keine Fehler**: Hersteller/Produkt ohne `cpe23`, die in den NVD-Daten nie vorkommen
++(z. B. „FortiGate“ statt `fortios`). Der Import wird trotzdem gespeichert; der Abgleich würde für diese Zeilen aber nichts finden.
++
++### `POST /import/sbom?asset_key=...&image_ref=...`
++CycloneDX-JSON von Syft (`syft <image> -o cyclonedx-json`), bis 20 MB. `image_ref` ist optional (sonst Name/Tag aus der SBOM).
++- Nur Pakete, keine Einzeldateien (`type = file` wird übersprungen); doppelte Einträge werden zusammengefasst.
++- Eltern-Komponente jedes Pakets ist das Image (`container_image`), Pfad also Image -> Paket.
++- **Schnappschuss je Asset und Image:** fehlende Pakete werden deaktiviert; neue Paketversion = neue Komponente
++  (offene Treffer der alten Version werden beim nächsten `/run` mit `component_removed` geschlossen).
++- Dieselbe Datei (gleicher SHA-256) wird nicht erneut verarbeitet (`"unchanged": true`).
++
++Antwort: `{"image_ref", "unchanged", "packages", "packages_matchable", "os_packages_not_matched", "files_skipped", "components_created", "components_updated", "components_deactivated"}`.
++Fehler: 404 (Asset unbekannt), 409 (Asset deaktiviert), 413, 415, 422 (keine CycloneDX-Datei, keine Pakete).
+ 
+ ### `POST /suppressions`
+ Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion nicht aktiv", "created_by": "analyst@..."}`.
+-`match_key` steht in jedem Treffer (`cve_id` oder `raw:<raw_item_id>`). Der Treffer wird mit
+-`resolved_reason = suppressed` geschlossen und beim erneuten Abgleich übersprungen.
++`match_key` steht in jedem Treffer (`cve_id` oder `raw:<raw_item_id>`). Alle offenen Treffer dieser Kombination werden
++**sofort** mit `resolved_reason = suppressed` geschlossen und beim erneuten Abgleich übersprungen.
++Antwort: `{"suppression_id", "created", "matches_resolved"}` (erneutes Markieren: `created = false`).
++
++`GET /suppressions` listet aktive Markierungen. `DELETE /suppressions/{id}` hebt eine Markierung auf (nur deaktiviert);
++der nächste `/run` gleicht wieder ab und öffnet den Treffer mit einer neuen Bewertung.
+ 
+ ## 7. Authentifizierung und Fehler
+ 
+@@ -195,12 +214,11 @@ Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion n
+ | 200 | Erfolg |
+ | 401 | `X-API-Key` fehlt oder ist falsch |
+ | 404 | `asset_key` (SBOM) oder `component_id` (Fehlalarm) existiert nicht |
+-| 409 | Ein `/run` oder Import läuft bereits (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
+-| 413 | Datei zu groß (vorläufig 5 MB) |
++| 409 | Ein `/run`, Import oder eine Fehlalarm-Änderung läuft bereits, oder SBOM für ein deaktiviertes Asset (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
++| 413 | Datei zu groß (CSV 5 MB, SBOM 20 MB) |
+ | 415 | Falscher Dateityp (kein CSV bzw. kein CycloneDX-JSON) |
+ | 422 | Inhalt ungültig; Import zusätzlich mit `"errors": [{"row": 5, "field": "criticality", "message": "..."}]` |
+ | 500 | Unerwarteter Fehler: allgemeine Meldung, Details nur im Log, **keine Inventardaten in der Antwort** |
+-| 501 | Endpunkt noch nicht umgesetzt (SBOM-Import, Fehlalarme) |
+ 
+ ## 8. Risiko-Score
+ 
+@@ -297,13 +315,16 @@ M3_TEST_DATABASE_URL=postgresql://argos:argos@localhost:5432/argos python -m pyt
+ Der Durchlauf mit DB nutzt synthetische Daten (`CVE-2099-*`, `example.invalid`) und **leert alle Tabellen in `m3`**:
+ nur gegen die lokale Entwicklungsdatenbank laufen lassen. Geprüft werden u. a.: Import und Fehlerliste,
+ Treffer und Nicht-Treffer nach Version, Neubewertung bei KEV-Änderung (neue `risk_assessment_id`),
+-Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409.
++Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409,
++Inventarfunde ohne Meldung, Namenshinweise, Fehlalarm markieren und aufheben,
++SBOM-Import (`tests/test_sbom_integration.py`): purl/OSV-Treffer mit Pfad, PyPI-Namen, deb nicht abgeglichen, neue SBOM-Version.
+ 
+ ## 13. Offene Punkte
+ 
+ | An | Frage / Hinweis |
+ |---|---|
+-| M4 | Passen CSV-Format, die drei Views und `/suppressions`? Sollen Entwarnungen (`resolved`) auch benachrichtigt werden? |
++| M4 | Inventarfunde haben `raw_item_id = NULL`: `m4.notification_log.raw_item_id` und `item_status` setzen bisher eine Meldung voraus. Vorschlag: Inventarfunde nur ab `high` oder bei KEV sofort melden, den Rest nur in Übersicht/Bericht. |
++| M1 | OSV-Daten gibt es bisher nur für CVEs aus Meldungen. Damit der SBOM-Abgleich (Weg 2) auch ohne Meldung viel findet, bräuchte es OSV-Daten für die Pakete aus den SBOMs (z. B. OSV-Batch-Abfrage je purl). |
+ | M2 | Hinweis: Ältere Meldungen bekommen kein neues Trust-Score, wenn spätere Quellen sie bestätigen. M3 würde eine Aktualisierung automatisch übernehmen. |
+ | M2 | Hinweis: `entities.version_text` wird bisher nicht befüllt, daher ist der Ersatzweg ohne CVE nur auf Produktebene möglich. |
+ | M1 | Ab wann gibt es echte Daten? Bis dahin testet M3 mit synthetischen Daten. |
+diff --git a/m3_risk/app/config.py b/m3_risk/app/config.py
+index 8598d99..9597af8 100644
+--- a/m3_risk/app/config.py
++++ b/m3_risk/app/config.py
+@@ -14,6 +14,7 @@ RISK_POLICY_PATH = Path(os.getenv("M3_RISK_POLICY", Path(__file__).resolve().par
+ 
+ # Grenzen fuer Uploads und Laeufe
+ MAX_UPLOAD_BYTES = int(os.getenv("M3_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
++MAX_SBOM_BYTES = int(os.getenv("M3_MAX_SBOM_BYTES", str(20 * 1024 * 1024)))   # Syft-SBOMs grosser Images: mehrere MB
+ MAX_ATTEMPTS = max(1, int(os.getenv("M3_MAX_ATTEMPTS", "5")))      # fehlgeschlagene Meldungen nicht endlos wiederholen
+ RUN_LIMIT = max(1, int(os.getenv("M3_RUN_LIMIT", "500")))          # hoechstens so viele Meldungen je /run
+ 
+diff --git a/m3_risk/app/inventory.py b/m3_risk/app/inventory.py
+index 50d08fe..171d29c 100644
+--- a/m3_risk/app/inventory.py
++++ b/m3_risk/app/inventory.py
+@@ -160,7 +160,7 @@ def parse_csv(data: bytes) -> ParsedInventory:
+         seen_products[dup_key] = rownum
+ 
+         result.components[key].append({
+-            "name": product, "vendor": vendor, "version": version, "vendor_norm": vendor_norm,
++            "row": rownum, "name": product, "vendor": vendor, "version": version, "vendor_norm": vendor_norm,
+             "product_norm": product_norm, "component_type": comp_type, "vendor_country": country,
+             "cpe23": cpe23,
+         })
+@@ -172,6 +172,33 @@ def parse_csv(data: bytes) -> ParsedInventory:
+     return result
+ 
+ 
++def naming_warnings(conn, inv: ParsedInventory) -> list[dict[str, Any]]:
++    """Hinweise (keine Fehler): Hersteller/Produkt ohne cpe23, die in den NVD-Daten nie vorkommen.
++    Dann passt die Schreibweise vermutlich nicht zu NVD, und der Abgleich wuerde nichts finden."""
++    candidates = [(key, c) for key, comps in inv.components.items() for c in comps if not c["cpe23"]]
++    if not candidates:
++        return []
++    if conn.execute("SELECT NOT EXISTS (SELECT 1 FROM public.cve_affected WHERE data_source = 'nvd') AS empty"
++                    ).fetchone()["empty"]:
++        return [{"row": None, "asset_key": None, "message":
++                 "Noch keine NVD-Daten vorhanden, Pruefung der Produktnamen uebersprungen"}]
++    known = {(r["vendor"], r["product"]) for r in conn.execute("""
++        SELECT DISTINCT vendor, product FROM public.cve_affected
++         WHERE data_source = 'nvd' AND product = ANY(%s)""",
++        ([c["product_norm"] for _, c in candidates],)).fetchall()}
++    known_products = {p for _, p in known}
++    warnings = []
++    for key, c in candidates:
++        found = ((c["vendor_norm"], c["product_norm"]) in known if c["vendor_norm"]
++                 else c["product_norm"] in known_products)
++        if not found:
++            warnings.append({
++                "row": c["row"], "asset_key": key,
++                "message": f"'{c['vendor'] or ''} {c['name']}' kommt in den NVD-Daten nicht vor "
++                           f"(als '{c['vendor_norm'] or '-'}:{c['product_norm']}'). Schreibweise pruefen oder cpe23 angeben."})
++    return warnings
++
++
+ def apply_inventory(conn, inv: ParsedInventory) -> dict[str, int]:
+     """Schreibt den Schnappschuss. Muss innerhalb einer Transaktion aufgerufen werden."""
+     stats = {k: 0 for k in ("assets_created", "assets_updated", "assets_deactivated",
+diff --git a/m3_risk/app/main.py b/m3_risk/app/main.py
+index 6f5ab77..9955d57 100644
+--- a/m3_risk/app/main.py
++++ b/m3_risk/app/main.py
+@@ -15,10 +15,14 @@ from typing import Iterator
+ import psycopg
+ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+ from fastapi.responses import JSONResponse
++from pydantic import BaseModel, Field
+ from psycopg.rows import dict_row
+ 
+ from . import config, pipeline
+-from .inventory import CsvValidationError, apply_inventory, parse_csv
++import hashlib
++
++from .inventory import CsvValidationError, apply_inventory, naming_warnings, parse_csv
++from .sbom import SbomError, apply_sbom, default_image_ref, parse_cyclonedx
+ from .risk import load_policy
+ 
+ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+@@ -29,6 +33,7 @@ app = FastAPI(title="M3 Unternehmensabgleich, Lieferkette und Risiko")
+ POLICY = load_policy(config.RISK_POLICY_PATH)     # ungueltige Regeln -> Start schlaegt sofort fehl
+ RUN_MUTEX = threading.Lock()
+ 
++JSON_TYPES = {"application/json", "application/vnd.cyclonedx+json", "text/plain", "application/octet-stream"}
+ CSV_TYPES = {"text/csv", "application/csv", "application/vnd.ms-excel", "text/plain", "application/octet-stream"}
+ 
+ 
+@@ -87,19 +92,85 @@ async def import_assets(file: UploadFile = File(...)):
+         return JSONResponse(status_code=422, content={"detail": exc.message, "errors": exc.errors})
+     with exclusive_db() as conn:
+         with conn.transaction():
+-            return apply_inventory(conn, inventory)
++            result = apply_inventory(conn, inventory)
++            result["warnings"] = naming_warnings(conn, inventory)
++            return result
+ 
+ 
+ @app.post("/import/sbom", dependencies=[Depends(authorize)])
+-def import_sbom():
+-    raise HTTPException(status_code=501, detail="SBOM-Import folgt im naechsten PR")
++async def import_sbom(asset_key: str, image_ref: str | None = None, file: UploadFile = File(...)):
++    name = (file.filename or "").lower()
++    ctype = (file.content_type or "").split(";")[0]
++    if not name.endswith(".json") and ctype not in JSON_TYPES:
++        raise HTTPException(status_code=415, detail="CycloneDX-JSON erwartet")
++    data = await file.read(config.MAX_SBOM_BYTES + 1)
++    if len(data) > config.MAX_SBOM_BYTES:
++        raise HTTPException(status_code=413, detail=f"Datei groesser als {config.MAX_SBOM_BYTES // (1024 * 1024)} MB")
++    try:
++        parsed = parse_cyclonedx(data)
++    except SbomError as exc:
++        return JSONResponse(status_code=422, content={"detail": str(exc)})
++    ref = (image_ref or default_image_ref(parsed) or "").strip()
++    if not ref:
++        return JSONResponse(status_code=422, content={"detail": "image_ref fehlt und steht nicht in der SBOM"})
++    with exclusive_db() as conn:
++        with conn.transaction():
++            asset = conn.execute("SELECT id, is_active FROM m3.assets WHERE asset_key = %s", (asset_key,)).fetchone()
++            if asset is None:
++                raise HTTPException(status_code=404, detail=f"Asset '{asset_key}' existiert nicht")
++            if not asset["is_active"]:
++                raise HTTPException(status_code=409, detail=f"Asset '{asset_key}' ist deaktiviert")
++            return apply_sbom(conn, asset["id"], ref, parsed, hashlib.sha256(data).hexdigest())
++
++
++class SuppressionIn(BaseModel):
++    component_id: int
++    match_key: str = Field(min_length=1, max_length=200)
++    reason: str = Field(min_length=1, max_length=1000)
++    created_by: str = Field(min_length=1, max_length=200)
++
++
++@app.get("/suppressions", dependencies=[Depends(authorize)])
++def list_suppressions() -> list[dict]:
++    with psycopg.connect(config.DATABASE_URL, row_factory=dict_row) as conn:
++        return conn.execute("""SELECT s.id, s.component_id, c.name AS component_name, a.asset_key, s.match_key,
++                                      s.reason, s.created_by, s.created_at
++                                 FROM m3.suppressions s
++                                 JOIN m3.sbom_components c ON c.id = s.component_id
++                                 JOIN m3.assets a ON a.id = c.asset_id
++                                WHERE s.is_active ORDER BY s.id""").fetchall()
+ 
+ 
+ @app.post("/suppressions", dependencies=[Depends(authorize)])
+-def create_suppression():
+-    raise HTTPException(status_code=501, detail="Fehlalarm-Markierung folgt im naechsten PR")
++def create_suppression(body: SuppressionIn) -> dict:
++    """Markiert (Komponente, match_key) als Fehlalarm und schliesst offene Treffer sofort."""
++    with exclusive_db() as conn:
++        with conn.transaction():
++            if conn.execute("SELECT 1 FROM m3.sbom_components WHERE id = %s", (body.component_id,)).fetchone() is None:
++                raise HTTPException(status_code=404, detail=f"Komponente {body.component_id} existiert nicht")
++            existing = conn.execute("SELECT id FROM m3.suppressions WHERE component_id = %s AND match_key = %s "
++                                    "AND is_active", (body.component_id, body.match_key)).fetchone()
++            if existing:
++                sid, created = existing["id"], False
++            else:
++                sid = conn.execute("INSERT INTO m3.suppressions (component_id, match_key, reason, created_by) "
++                                   "VALUES (%s,%s,%s,%s) RETURNING id",
++                                   (body.component_id, body.match_key, body.reason, body.created_by)).fetchone()["id"]
++                created = True
++            closed = conn.execute("""UPDATE m3.matches SET status = 'resolved', resolved_at = now(),
++                                            resolved_reason = 'suppressed'
++                                      WHERE component_id = %s AND match_key = %s AND status = 'open'""",
++                                  (body.component_id, body.match_key)).rowcount
++            return {"suppression_id": sid, "created": created, "matches_resolved": closed}
+ 
+ 
+ @app.delete("/suppressions/{suppression_id}", dependencies=[Depends(authorize)])
+-def delete_suppression(suppression_id: int):
+-    raise HTTPException(status_code=501, detail="Fehlalarm-Markierung folgt im naechsten PR")
++def delete_suppression(suppression_id: int) -> dict:
++    """Hebt die Markierung auf (nur deaktiviert). Der naechste /run gleicht wieder ab."""
++    with exclusive_db() as conn:
++        with conn.transaction():
++            n = conn.execute("UPDATE m3.suppressions SET is_active = false WHERE id = %s AND is_active",
++                             (suppression_id,)).rowcount
++            if n == 0:
++                raise HTTPException(status_code=404, detail=f"Aktive Markierung {suppression_id} existiert nicht")
++            return {"suppression_id": suppression_id, "lifted": True}
+diff --git a/m3_risk/app/matching.py b/m3_risk/app/matching.py
+index 9388dc8..bffa0e4 100644
+--- a/m3_risk/app/matching.py
++++ b/m3_risk/app/matching.py
+@@ -1,4 +1,4 @@
+-"""Abgleich Meldung -> Inventar ueber CVE und NVD-CPE (Wege 1 und 3 im README).
++"""Abgleich Meldung -> Inventar ueber CVE: NVD-CPE (Wege 1 und 3) und OSV-Pakete aus SBOMs (Weg 2).
+ 
+ Ablauf je Meldung:
+   1. Kandidaten per SQL: cve_affected (NVD) mit gleichem Hersteller/Produkt wie eine aktive Komponente
+@@ -85,35 +85,60 @@ def dependency_path(conn, component_id: int) -> list[int]:
+     return [r["id"] for r in rows]
+ 
+ 
+-def match_cves(conn, cve_ids: list[str]) -> MatchResult:
+-    result = MatchResult(candidates={}, not_affected=set())
+-    if not cve_ids:
+-        return result
+-    rows = conn.execute("""
+-        SELECT ca.cve_id, ca.cpe, ca.vendor, ca.product,
+-               ca.version_exact, ca.version_start_including, ca.version_start_excluding,
+-               ca.version_end_including, ca.version_end_excluding,
+-               c.id AS component_id, c.asset_id, c.version AS comp_version, c.cpe23 AS comp_cpe
+-          FROM public.cve_affected ca
+-          JOIN m3.sbom_components c
+-            ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
+-          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+-         WHERE ca.data_source = 'nvd' AND ca.cve_id = ANY(%s)
+-         ORDER BY ca.cve_id, c.id, ca.cpe
+-    """, (cve_ids,)).fetchall()
++_NVD_SQL = """
++    SELECT ca.cve_id, ca.cpe, ca.vendor, ca.product,
++           ca.version_exact, ca.version_start_including, ca.version_start_excluding,
++           ca.version_end_including, ca.version_end_excluding,
++           c.id AS component_id, c.asset_id, c.version AS comp_version, c.cpe23 AS comp_cpe
++      FROM public.cve_affected ca
++      JOIN m3.sbom_components c
++        ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
++      JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
++     WHERE ca.data_source = 'nvd' AND ca.cve_id = ANY(%s)
++     ORDER BY ca.cve_id, c.id, ca.cpe
++"""
++
++# PyPI-Namen werden wie in sbom.normalize_pypi verglichen (PEP 503), andere Oekosysteme exakt.
++_OSV_SQL = """
++    SELECT ca.cve_id, ca.ecosystem, ca.package_name,
++           ca.version_exact, ca.version_start_including, ca.version_start_excluding,
++           ca.version_end_including, ca.version_end_excluding,
++           c.id AS component_id, c.asset_id, c.version AS comp_version, c.purl AS comp_purl
++      FROM public.cve_affected ca
++      JOIN m3.sbom_components c
++        ON c.osv_ecosystem = ca.ecosystem AND c.is_active
++       AND c.osv_package = CASE WHEN ca.ecosystem = 'PyPI'
++                                THEN lower(regexp_replace(ca.package_name, '[-_.]+', '-', 'g'))
++                                ELSE ca.package_name END
++      JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
++     WHERE ca.data_source = 'osv' AND ca.cve_id = ANY(%s)
++     ORDER BY ca.cve_id, c.id, ca.package_name
++"""
+ 
++
++def _osv_rule(row: dict[str, Any]) -> dict[str, Any]:
++    rule = {"source": "osv", "ecosystem": row["ecosystem"], "package": row["package_name"]}
++    rule.update({f: row[f] for f in RANGE_FIELDS if row[f] is not None})
++    return rule
++
++
++def _evaluate(result: MatchResult, rows: list[dict[str, Any]], source: str) -> None:
++    """Fasst die Regeln je (Komponente, CVE) zusammen: eine betroffene Regel reicht (Alternativen)."""
+     grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+     for row in rows:
+         grouped.setdefault((row["component_id"], row["cve_id"]), []).append(row)
+ 
+     for (component_id, cve_id), rules in grouped.items():
+-        version = _component_version(rules[0])
++        if source == "nvd":
++            version = _component_version(rules[0])
++        else:
++            version = rules[0]["comp_version"]
+         evaluated = []
+         for r in rules:
+-            exact = _exact_from_cpe(r)
++            exact = _exact_from_cpe(r) if source == "nvd" else r["version_exact"]
+             status = check_range(version, exact, r["version_start_including"], r["version_start_excluding"],
+                                  r["version_end_including"], r["version_end_excluding"])
+-            all_versions = exact is None and all(r[f] is None for f in RANGE_FIELDS[1:])
++            all_versions = is_wildcard(exact) and all(r[f] is None for f in RANGE_FIELDS[1:])
+             evaluated.append((status, all_versions, r))
+ 
+         affected = [e for e in evaluated if e[0] == "affected"]
+@@ -121,16 +146,24 @@ def match_cves(conn, cve_ids: list[str]) -> MatchResult:
+         if affected:
+             precise = [e for e in affected if not e[1]]
+             chosen = (precise or affected)[0]
+-            method, version_status = "cpe_version", "affected"
++            method = "cpe_version" if source == "nvd" else "purl_version"
++            version_status = "affected"
+             confidence = CONFIDENCE["all_versions" if chosen[1] else "range"]
+             used = [chosen[2]]
+         elif unknown:
+-            method, version_status, confidence = "cpe_product_only", "unknown", CONFIDENCE["unknown"]
++            method = "cpe_product_only" if source == "nvd" else "purl_version"
++            version_status, confidence = "unknown", CONFIDENCE["unknown"]
+             used = [e[2] for e in unknown]
+         else:
+-            result.not_affected.add((component_id, cve_id))
++            if (component_id, cve_id) not in result.candidates:
++                result.not_affected.add((component_id, cve_id))
+             continue
+ 
++        rule_fn = _rule if source == "nvd" else _osv_rule
++        current = result.candidates.get((component_id, cve_id))
++        if current and current.version_status == "affected" and version_status != "affected":
++            continue                                    # bereits sicher betroffen ueber die andere Quelle
++        result.not_affected.discard((component_id, cve_id))
+         result.candidates[(component_id, cve_id)] = Candidate(
+             component_id=component_id,
+             asset_id=rules[0]["asset_id"],
+@@ -138,10 +171,18 @@ def match_cves(conn, cve_ids: list[str]) -> MatchResult:
+             match_method=method,
+             confidence=confidence,
+             version_status=version_status,
+-            match_details={"component_version": version, "rules": [_rule(r) for r in used],
++            match_details={"component_version": version, "rules": [rule_fn(r) for r in used],
+                            "rules_checked": len(rules)},
+         )
+ 
++
++def match_cves(conn, cve_ids: list[str]) -> MatchResult:
++    """Abgleich ueber NVD-CPE (Wege 1 und 3) und OSV-Pakete aus SBOMs (Weg 2)."""
++    result = MatchResult(candidates={}, not_affected=set())
++    if not cve_ids:
++        return result
++    _evaluate(result, conn.execute(_NVD_SQL, (cve_ids,)).fetchall(), "nvd")
++    _evaluate(result, conn.execute(_OSV_SQL, (cve_ids,)).fetchall(), "osv")
+     for cand in result.candidates.values():
+         cand.dependency_path = dependency_path(conn, cand.component_id)
+     return result
+diff --git a/m3_risk/app/pipeline.py b/m3_risk/app/pipeline.py
+index a44ab1e..2553433 100644
+--- a/m3_risk/app/pipeline.py
++++ b/m3_risk/app/pipeline.py
+@@ -25,6 +25,7 @@ log = logging.getLogger("m3.pipeline")
+ 
+ CVE_CATEGORIES = {"VULNERABILITY", "ATTACK"}
+ NVD_URL = "https://nvd.nist.gov/vuln/detail/{}"
++OSV_URL = "https://osv.dev/vulnerability/{}"
+ KEV_URL = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+ EPSS_URL = "https://www.first.org/epss/"
+ 
+@@ -233,11 +234,16 @@ def _evidence(conn, assessment_id: int, item, m, fact) -> None:
+     rule = (m["match_details"].get("rules") or [{}])[0]
+     bounds = ", ".join(f"{k.replace('version_', '')}={v}" for k, v in rule.items() if k.startswith("version_"))
+     version = m["match_details"].get("component_version") or "unbekannt"
++    source = "OSV" if rule.get("source") == "osv" else "NVD"
++    source_url = (OSV_URL if source == "OSV" else NVD_URL).format(m["cve_id"])
+     if m["version_status"] == "affected":
+-        text = f"{m['component_name']} {version} liegt im betroffenen Bereich von {m['cve_id']}" + (f" ({bounds})" if bounds else " (alle Versionen)")
++        text = (f"{m['component_name']} {version} liegt laut {source} im betroffenen Bereich von {m['cve_id']}"
++                + (f" ({bounds})" if bounds else " (alle Versionen)"))
+     else:
+-        text = f"{m['component_name']} ist laut NVD betroffen, Version {version} ist nicht sicher vergleichbar"
+-    rows.append(("affected_version", text, "cve_affected", None, NVD_URL.format(m["cve_id"]), rule))
++        text = f"{m['component_name']} ist laut {source} betroffen, Version {version} ist nicht sicher vergleichbar"
++    if not m["is_direct"] and m.get("path_names"):
++        text += f"; enthalten in {' -> '.join(m['path_names'][:-1])}"
++    rows.append(("affected_version", text, "cve_affected", None, source_url, rule))
+     rows.append(("asset", f"System {m['asset_key']} ({m['asset_name']}), Kritikalität {m['criticality']}, "
+                  f"aus dem Internet erreichbar: {'ja' if m['internet_exposed'] else 'nein'}", "inventory", None, None,
+                  {"asset_id": m["asset_id"], "component_id": m["component_id"]}))
+@@ -270,6 +276,9 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
+     matches = conn.execute(f"""
+         SELECT m.*, c.name AS component_name, a.id AS asset_id, a.asset_key, a.name AS asset_name,
+                a.criticality, a.internet_exposed,
++               (SELECT array_agg(pc.name ORDER BY p.ord)
++                  FROM unnest(m.dependency_path) WITH ORDINALITY AS p(cid, ord)
++                  JOIN m3.sbom_components pc ON pc.id = p.cid) AS path_names,
+                ra.id AS current_id, ra.risk_fingerprint AS current_fp
+           FROM m3.matches m
+           JOIN m3.sbom_components c ON c.id = m.component_id
+@@ -354,6 +363,16 @@ def scan_inventory(conn, policy: Policy, now: datetime) -> int:
+           JOIN m3.sbom_components c ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
+           JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+          WHERE ca.data_source = 'nvd'
++        UNION
++        SELECT DISTINCT ca.cve_id
++          FROM public.cve_affected ca
++          JOIN m3.sbom_components c
++            ON c.osv_ecosystem = ca.ecosystem AND c.is_active
++           AND c.osv_package = CASE WHEN ca.ecosystem = 'PyPI'
++                                    THEN lower(regexp_replace(ca.package_name, '[-_.]+', '-', 'g'))
++                                    ELSE ca.package_name END
++          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
++         WHERE ca.data_source = 'osv'
+     """).fetchall()]
+     result = match_cves(conn, cves)
+     affected = {k: c for k, c in result.candidates.items() if c.version_status == "affected"}
+diff --git a/m3_risk/app/sbom.py b/m3_risk/app/sbom.py
+new file mode 100644
+index 0000000..c6c4855
+--- /dev/null
++++ b/m3_risk/app/sbom.py
+@@ -0,0 +1,206 @@
++"""SBOM-Import (CycloneDX JSON, z. B. von Syft) und purl -> OSV-Zuordnung.
++
++Grundsaetze (README Abschnitt 6):
++  * Nur Pakete, keine Einzeldateien (Syft listet sehr viele "file"-Eintraege).
++  * Eltern-Komponente jedes Pakets ist das Image selbst (Pfad: Image -> Paket).
++  * Schnappschuss je Asset und Image: fehlende Pakete werden deaktiviert, nie geloescht.
++  * Abgleich nur fuer Paketoekosysteme mit eindeutigen Namen und Versionen (npm, PyPI, Go, ...).
++    Betriebssystempakete (deb, apk, rpm) werden gespeichert, aber nicht abgeglichen.
++  * Von Syft geratene CPEs werden nur gespeichert, nicht fuer den Abgleich genutzt.
++"""
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass, field
++from typing import Any
++from urllib.parse import unquote
++
++# purl-Typ -> OSV-Oekosystem. Fehlt ein Typ, wird das Paket gespeichert, aber nicht abgeglichen.
++PURL_TO_OSV = {
++    "npm": "npm", "pypi": "PyPI", "golang": "Go", "maven": "Maven", "cargo": "crates.io",
++    "gem": "RubyGems", "nuget": "NuGet", "composer": "Packagist", "hex": "Hex", "pub": "Pub",
++}
++OS_PURL_TYPES = {"deb", "apk", "rpm", "alpm"}
++
++CDX_TYPES = {
++    "library": "library", "framework": "library", "application": "application",
++    "operating-system": "operating_system", "container": "container_image", "firmware": "firmware",
++}
++SKIP_TYPES = {"file"}
++
++
++class SbomError(ValueError):
++    pass
++
++
++@dataclass(frozen=True)
++class Purl:
++    type: str
++    namespace: str | None
++    name: str
++    version: str | None
++
++
++def parse_purl(value: str | None) -> Purl | None:
++    """pkg:type/namespace/name@version?qualifiers#subpath -> Purl; None, wenn ungueltig."""
++    if not value or not value.startswith("pkg:"):
++        return None
++    rest = value[4:].split("#", 1)[0].split("?", 1)[0]
++    if "/" not in rest:
++        return None
++    ptype, path = rest.split("/", 1)
++    version = None
++    if "@" in path:
++        path, version = path.rsplit("@", 1)
++        version = unquote(version) or None
++    parts = [unquote(p) for p in path.strip("/").split("/") if p]
++    if not parts:
++        return None
++    namespace = "/".join(parts[:-1]) or None
++    return Purl(ptype.lower(), namespace, parts[-1], version)
++
++
++def normalize_pypi(name: str) -> str:
++    """PEP 503: Gross-/Kleinschreibung und -, _, . sind gleichwertig."""
++    return re.sub(r"[-_.]+", "-", name).lower()
++
++
++def osv_key(purl: Purl) -> tuple[str, str] | None:
++    """(OSV-Oekosystem, Paketname wie in OSV) oder None, wenn nicht abgleichbar."""
++    eco = PURL_TO_OSV.get(purl.type)
++    if eco is None:
++        return None
++    if purl.type == "pypi":
++        return eco, normalize_pypi(purl.name)
++    if purl.type == "maven":
++        return (eco, f"{purl.namespace}:{purl.name}") if purl.namespace else None
++    if purl.namespace and purl.type in {"npm", "golang", "composer"}:
++        return eco, f"{purl.namespace}/{purl.name}"
++    return eco, purl.name
++
++
++@dataclass
++class ParsedSbom:
++    image_name: str | None
++    image_version: str | None
++    packages: list[dict[str, Any]] = field(default_factory=list)
++    skipped_files: int = 0
++    os_packages: int = 0
++    matchable: int = 0
++
++
++def parse_cyclonedx(data: bytes) -> ParsedSbom:
++    try:
++        doc = json.loads(data.decode("utf-8-sig"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise SbomError(f"Kein gueltiges JSON: {exc}") from exc
++    if not isinstance(doc, dict) or doc.get("bomFormat") != "CycloneDX":
++        raise SbomError("Keine CycloneDX-SBOM (bomFormat fehlt oder ist nicht 'CycloneDX')")
++    meta = (doc.get("metadata") or {}).get("component") or {}
++    result = ParsedSbom(image_name=meta.get("name"), image_version=meta.get("version"))
++
++    seen: set[str] = set()
++    for comp in doc.get("components") or []:
++        if not isinstance(comp, dict):
++            continue
++        ctype = comp.get("type")
++        if ctype in SKIP_TYPES:
++            result.skipped_files += 1
++            continue
++        name = (comp.get("name") or "").strip()
++        if not name:
++            continue
++        version = (comp.get("version") or "").strip() or None
++        purl_text = comp.get("purl") or None
++        purl = parse_purl(purl_text)
++        key = purl_text or f"{name}@{version or ''}"
++        if key in seen:
++            continue                                   # Syft listet manche Pakete mehrfach (verschiedene Fundorte)
++        seen.add(key)
++        osv = osv_key(purl) if purl else None
++        if purl and purl.type in OS_PURL_TYPES:
++            result.os_packages += 1
++        if osv:
++            result.matchable += 1
++        cpe = comp.get("cpe")
++        result.packages.append({
++            "name": name,
++            "version": version or (purl.version if purl else None),
++            "component_type": CDX_TYPES.get(ctype, "other"),
++            "purl": purl_text if purl_text and purl_text.startswith("pkg:") else None,
++            "cpe23": cpe if isinstance(cpe, str) and cpe.startswith("cpe:2.3:") else None,
++            "osv_ecosystem": osv[0] if osv else None,
++            "osv_package": osv[1] if osv else None,
++        })
++    if not result.packages:
++        raise SbomError("SBOM enthaelt keine Pakete")
++    return result
++
++
++def default_image_ref(parsed: ParsedSbom) -> str | None:
++    if not parsed.image_name:
++        return None
++    v = parsed.image_version
++    if v and not v.startswith("sha256:"):
++        return f"{parsed.image_name}:{v}"
++    return parsed.image_name
++
++
++def apply_sbom(conn, asset_id: int, image_ref: str, parsed: ParsedSbom, sha256: str) -> dict[str, Any]:
++    """Schreibt den Schnappschuss eines Images. Muss in einer Transaktion laufen."""
++    stats: dict[str, Any] = {"image_ref": image_ref, "unchanged": False, "packages": len(parsed.packages),
++                             "packages_matchable": parsed.matchable, "os_packages_not_matched": parsed.os_packages,
++                             "files_skipped": parsed.skipped_files,
++                             "components_created": 0, "components_updated": 0, "components_deactivated": 0}
++    image_purl = f"pkg:docker/{image_ref.split('@', 1)[0]}"
++    image = conn.execute(
++        "SELECT id, sbom_sha256, is_active FROM m3.sbom_components "
++        "WHERE origin = 'sbom' AND asset_id = %s AND image_ref = %s AND purl = %s FOR UPDATE",
++        (asset_id, image_ref, image_purl)).fetchone()
++    if image and image["is_active"] and image["sbom_sha256"] == sha256:
++        stats["unchanged"] = True                        # gleiche Datei schon importiert
++        return stats
++    if image is None:
++        image_id = conn.execute(
++            "INSERT INTO m3.sbom_components (asset_id, origin, component_type, name, version, purl, image_ref, sbom_sha256) "
++            "VALUES (%s,'sbom','container_image',%s,%s,%s,%s,%s) RETURNING id",
++            (asset_id, image_ref, parsed.image_version, image_purl, image_ref, sha256)).fetchone()["id"]
++        stats["components_created"] += 1
++    else:
++        image_id = image["id"]
++        conn.execute("UPDATE m3.sbom_components SET version=%s, sbom_sha256=%s, is_active=true WHERE id=%s",
++                     (parsed.image_version, sha256, image_id))
++        stats["components_updated"] += 1
++
++    existing = {r["k"]: r for r in conn.execute(
++        "SELECT id, coalesce(purl, name || '@' || coalesce(version, '')) AS k, is_active, version, component_type "
++        "FROM m3.sbom_components WHERE origin = 'sbom' AND asset_id = %s AND image_ref = %s AND id <> %s",
++        (asset_id, image_ref, image_id)).fetchall()}
++    kept: list[int] = [image_id]
++    for p in parsed.packages:
++        key = p["purl"] or f"{p['name']}@{p['version'] or ''}"
++        row = existing.get(key)
++        if row is None:
++            new_id = conn.execute(
++                "INSERT INTO m3.sbom_components (asset_id, parent_component_id, origin, component_type, name, version, "
++                "purl, cpe23, osv_ecosystem, osv_package, image_ref, sbom_sha256) "
++                "VALUES (%s,%s,'sbom',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
++                (asset_id, image_id, p["component_type"], p["name"], p["version"], p["purl"], p["cpe23"],
++                 p["osv_ecosystem"], p["osv_package"], image_ref, sha256)).fetchone()["id"]
++            stats["components_created"] += 1
++            kept.append(new_id)
++            continue
++        kept.append(row["id"])
++        conn.execute(
++            "UPDATE m3.sbom_components SET parent_component_id=%s, component_type=%s, version=%s, cpe23=%s, "
++            "osv_ecosystem=%s, osv_package=%s, sbom_sha256=%s, is_active=true WHERE id=%s",
++            (image_id, p["component_type"], p["version"], p["cpe23"], p["osv_ecosystem"], p["osv_package"],
++             sha256, row["id"]))
++        if not row["is_active"] or row["version"] != p["version"] or row["component_type"] != p["component_type"]:
++            stats["components_updated"] += 1
++    stats["components_deactivated"] = conn.execute(
++        "UPDATE m3.sbom_components SET is_active = false "
++        "WHERE origin = 'sbom' AND asset_id = %s AND image_ref = %s AND is_active AND NOT (id = ANY(%s))",
++        (asset_id, image_ref, kept)).rowcount
++    return stats
+diff --git a/m3_risk/tests/fixtures/sbom_small.cdx.json b/m3_risk/tests/fixtures/sbom_small.cdx.json
+new file mode 100644
+index 0000000..5fc8067
+--- /dev/null
++++ b/m3_risk/tests/fixtures/sbom_small.cdx.json
+@@ -0,0 +1,19 @@
++{
++  "bomFormat": "CycloneDX",
++  "specVersion": "1.6",
++  "metadata": {
++    "component": {"type": "container", "name": "example/webapp", "version": "1.0", "bom-ref": "img"}
++  },
++  "components": [
++    {"type": "library", "name": "axios", "version": "1.6.0", "purl": "pkg:npm/axios@1.6.0",
++     "cpe": "cpe:2.3:a:axios:axios:1.6.0:*:*:*:*:*:*:*"},
++    {"type": "library", "name": "axios", "version": "1.6.0", "purl": "pkg:npm/axios@1.6.0"},
++    {"type": "library", "name": "@acme/tools", "version": "2.0.0", "purl": "pkg:npm/%40acme/tools@2.0.0"},
++    {"type": "library", "name": "Django", "version": "4.2.0", "purl": "pkg:pypi/django@4.2.0"},
++    {"type": "library", "name": "golang.org/x/net", "version": "v0.17.0", "purl": "pkg:golang/golang.org/x/net@v0.17.0"},
++    {"type": "library", "name": "libssl3", "version": "3.0.11-1",
++     "purl": "pkg:deb/debian/libssl3@3.0.11-1?arch=amd64&distro=debian-12"},
++    {"type": "operating-system", "name": "debian", "version": "12"},
++    {"type": "file", "name": "/usr/lib/libssl.so.3"}
++  ]
++}
+diff --git a/m3_risk/tests/test_integration.py b/m3_risk/tests/test_integration.py
+index 195bf2a..d47c150 100644
+--- a/m3_risk/tests/test_integration.py
++++ b/m3_risk/tests/test_integration.py
+@@ -23,6 +23,7 @@ KEY = "test-key"
+ H = {"X-API-Key": KEY}
+ CVE_FW = "CVE-2099-0001"        # FortiOS, Bereich 7.2.0 bis < 7.2.7
+ CVE_LIB = "CVE-2099-0002"       # Tomcat, Version im Inventar nicht vergleichbar
++CVE_INV = "CVE-2099-0003"       # FortiOS, Bereich 7.2.0 bis < 7.2.5, von keiner Meldung genannt
+ 
+ HEADER = "asset_key,name,asset_type,criticality,internet_exposed,vendor,product,version,component_type,vendor_country\n"
+ CSV_V1 = (HEADER
+@@ -73,7 +74,7 @@ def db():
+     conn.execute("DELETE FROM m2.entities WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
+     conn.execute("DELETE FROM m2.trust_scores WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
+     conn.execute("DELETE FROM m2.summaries WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
+-    conn.execute("DELETE FROM public.cve_facts WHERE cve_id = ANY(%s)", ([CVE_FW, CVE_LIB],))
++    conn.execute("DELETE FROM public.cve_facts WHERE cve_id = ANY(%s)", ([CVE_FW, CVE_LIB, CVE_INV],))
+     conn.execute("DELETE FROM public.raw_items WHERE source_id = %s", (src,))
+     conn.execute("DELETE FROM public.sources WHERE id = %s", (src,))
+     conn.close()
+@@ -236,6 +237,58 @@ def test_criticality_change_rescores_same_match(client, db):
+     assert after["risk_score"] < before["risk_score"]
+ 
+ 
++# ---------------------------------------------------------------- Inventarfunde ohne Meldung
++
++def _by_cve(conn, cve, view="findings_current"):
++    return conn.execute(f"SELECT * FROM m3.{view} WHERE cve_id = %s ORDER BY match_id", (cve,)).fetchall()
++
++
++def test_inventory_scan_finds_known_cve_without_report(client, db):
++    conn, _ = db
++    upload(client, CSV_V1)                                   # Ausgangszustand: alle Assets aktiv, FortiOS 7.2.4
++    conn.execute("INSERT INTO public.cve_facts (cve_id, cvss_score, cvss_version, kev_listed, epss_score) "
++                 "VALUES (%s, 8.8, '3.1', true, 0.5)", (CVE_INV,))
++    conn.execute("""INSERT INTO public.cve_affected (cve_id, data_source, cpe, vendor, product,
++                        version_start_including, version_end_excluding)
++                    VALUES (%s,'nvd','cpe:2.3:o:fortinet:fortios:*:*:*:*:*:*:*:*','fortinet','fortios','7.2.0','7.2.5')""",
++                 (CVE_INV,))
++    r = client.post("/run", headers=H)
++    assert r.status_code == 200, r.text
++    rows = _by_cve(conn, CVE_INV)
++    assert [x["asset_key"] for x in rows] == ["fw-01"]                     # fw-02 hat 7.4.1 -> nicht betroffen
++    f = rows[0]
++    assert f["raw_item_id"] is None and f["title"].startswith("Bekannte Schwachstelle")
++    assert f["url"] == f"https://nvd.nist.gov/vuln/detail/{CVE_INV}"
++    assert f["risk_level"] in ("critical", "high")                         # KEV + Internet + sicher betroffen
++    assert "trust" in f["factor_breakdown"]["missing"]                     # ohne Meldung kein Trust-Score aus M2
++    assert {e["claim_key"] for e in f["evidence"]} >= {"affected_version", "asset", "cvss", "kev_listed"}
++
++
++def test_inventory_finding_hidden_when_report_names_same_cve(client, db):
++    conn, _ = db
++    hist = [x for x in _by_cve(conn, CVE_FW, "findings_history") if x["asset_key"] == "fw-01" and x["status"] == "open"]
++    assert sorted(x["raw_item_id"] is None for x in hist) == [False, True]  # Meldung + Inventarfund
++    cur = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"]
++    assert len(cur) == 1 and cur[0]["raw_item_id"] is not None            # nur einmal angezeigt
++
++
++def test_inventory_scan_ignores_unclear_versions(client, db):
++    conn, _ = db
++    rows = [x for x in _by_cve(conn, CVE_LIB, "findings_history") if x["raw_item_id"] is None]
++    assert rows == []                                                       # Tomcat "9.x-custom": kein Inventarfund
++
++
++def test_inventory_finding_resolved_after_update(client, db):
++    conn, _ = db
++    upload(client, CSV_V1.replace("FortiOS,7.2.4", "FortiOS,7.2.7"))
++    client.post("/run", headers=H)
++    assert _by_cve(conn, CVE_INV) == []
++    hist = _by_cve(conn, CVE_INV, "findings_history")
++    assert [(x["status"], x["resolved_reason"]) for x in hist] == [("resolved", "version_not_affected")]
++    upload(client, CSV_V1)                                                  # wieder zurueck fuer folgende Tests
++    client.post("/run", headers=H)
++
++
+ def test_parallel_run_returns_409(client):
+     from app import main
+     assert main.RUN_MUTEX.acquire(blocking=False)
+@@ -245,6 +298,39 @@ def test_parallel_run_returns_409(client):
+         main.RUN_MUTEX.release()
+ 
+ 
+-def test_not_yet_implemented_endpoints(client):
+-    assert client.post("/import/sbom", headers=H).status_code == 501
+-    assert client.post("/suppressions", headers=H).status_code == 501
++def test_naming_warnings_on_import(client, db):
++    r = upload(client, CSV_V1)
++    assert r.status_code == 200
++    warned = {w["asset_key"] for w in r.json()["warnings"]}
++    assert warned == {"ai-01"}            # qwen2.5 gibt es in NVD nicht; FortiOS und Tomcat (Alias apache) schon
++
++
++def test_suppression_closes_and_reopens(client, db):
++    conn, _ = db
++    client.post("/run", headers=H)
++    fw = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"][0]
++    body = {"component_id": fw["component_id"], "match_key": CVE_FW, "reason": "Funktion nicht aktiv",
++            "created_by": "analyst@test"}
++    r = client.post("/suppressions", headers=H, json=body)
++    assert r.status_code == 200, r.text
++    assert r.json()["created"] is True and r.json()["matches_resolved"] == 2   # Meldung + Inventarfund
++    assert client.post("/suppressions", headers=H, json=body).json()["created"] is False
++    assert [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"] == []
++    client.post("/run", headers=H)                                           # bleibt geschlossen
++    hist = [x for x in _by_cve(conn, CVE_FW, "findings_history") if x["asset_key"] == "fw-01"]
++    assert {x["resolved_reason"] for x in hist} == {"suppressed"}
++    listed = client.get("/suppressions", headers=H).json()
++    assert [s["match_key"] for s in listed] == [CVE_FW]
++
++    sid = r.json()["suppression_id"]
++    assert client.delete(f"/suppressions/{sid}", headers=H).status_code == 200
++    assert client.delete(f"/suppressions/{sid}", headers=H).status_code == 404
++    client.post("/run", headers=H)
++    reopened = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"]
++    assert len(reopened) == 1 and reopened[0]["risk_assessment_id"] != fw["risk_assessment_id"]
++
++
++def test_suppression_unknown_component_404(client):
++    body = {"component_id": 999999, "match_key": CVE_FW, "reason": "x", "created_by": "y"}
++    assert client.post("/suppressions", headers=H, json=body).status_code == 404
++    assert client.post("/suppressions", json=body).status_code == 401
+diff --git a/m3_risk/tests/test_logic.py b/m3_risk/tests/test_logic.py
+index 5a0c458..ba3c99d 100644
+--- a/m3_risk/tests/test_logic.py
++++ b/m3_risk/tests/test_logic.py
+@@ -1,4 +1,4 @@
+-﻿"""Unit-Tests ohne Datenbank: Normalisierung, Versionsvergleich, Risiko-Score, CSV-Pruefung.
++"""Unit-Tests ohne Datenbank: Normalisierung, Versionsvergleich, Risiko-Score, CSV-Pruefung.
+ Start (im Ordner m3_risk):  python -m pytest tests
+ """
+ from __future__ import annotations
+@@ -235,3 +235,45 @@ def test_csv_header_errors():
+         parse_csv(b"asset_key,name,typo\nfw-01,x,y\n")
+     msg = " ".join(e["message"] for e in exc.value.errors)
+     assert "Pflichtspalten fehlen" in msg and "Unbekannte Spalten" in msg
++
++
++# ---------------------------------------------------------------- SBOM / purl
++
++from app import sbom  # noqa: E402
++
++FIXTURE = Path(__file__).resolve().parent / "fixtures" / "sbom_small.cdx.json"
++
++
++@pytest.mark.parametrize("purl, expected", [
++    ("pkg:npm/axios@1.6.0", ("npm", "axios")),
++    ("pkg:npm/%40acme/tools@2.0.0", ("npm", "@acme/tools")),
++    ("pkg:pypi/Django_Rest.Framework@3.0", ("PyPI", "django-rest-framework")),
++    ("pkg:golang/golang.org/x/net@v0.17.0", ("Go", "golang.org/x/net")),
++    ("pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", ("Maven", "org.apache.logging.log4j:log4j-core")),
++    ("pkg:deb/debian/libssl3@3.0.11-1?distro=debian-12", None),      # Betriebssystempaket: nicht abgleichen
++])
++def test_osv_key(purl, expected):
++    assert sbom.osv_key(sbom.parse_purl(purl)) == expected
++
++
++def test_parse_purl_version_and_qualifiers():
++    p = sbom.parse_purl("pkg:deb/debian/libssl3@3.0.11-1?arch=amd64&distro=debian-12#sub")
++    assert (p.type, p.namespace, p.name, p.version) == ("deb", "debian", "libssl3", "3.0.11-1")
++    assert sbom.parse_purl("not-a-purl") is None
++
++
++def test_parse_cyclonedx_fixture():
++    parsed = sbom.parse_cyclonedx(FIXTURE.read_bytes())
++    names = [p["name"] for p in parsed.packages]
++    assert names.count("axios") == 1                        # Duplikat entfernt
++    assert "/usr/lib/libssl.so.3" not in names and parsed.skipped_files == 1
++    assert parsed.matchable == 4 and parsed.os_packages == 1
++    assert sbom.default_image_ref(parsed) == "example/webapp:1.0"
++    django = next(p for p in parsed.packages if p["name"] == "Django")
++    assert (django["osv_ecosystem"], django["osv_package"]) == ("PyPI", "django")
++
++
++@pytest.mark.parametrize("data", [b"{not json", b'{"bomFormat": "SPDX"}', b'{"bomFormat": "CycloneDX", "components": []}'])
++def test_parse_cyclonedx_rejects_invalid(data):
++    with pytest.raises(sbom.SbomError):
++        sbom.parse_cyclonedx(data)
+diff --git a/m3_risk/tests/test_sbom_integration.py b/m3_risk/tests/test_sbom_integration.py
+new file mode 100644
+index 0000000..62f90c6
+--- /dev/null
++++ b/m3_risk/tests/test_sbom_integration.py
+@@ -0,0 +1,133 @@
++"""SBOM-Import und Abgleich ueber purl/OSV gegen eine echte Datenbank (synthetische Daten).
++
++NUR gegen eine Wegwerf-Datenbank laufen lassen: der Test leert alle Tabellen im Schema m3.
++Start wie test_integration.py:  M3_TEST_DATABASE_URL=... python -m pytest tests
++"""
++from __future__ import annotations
++
++import os
++import uuid
++from pathlib import Path
++
++import psycopg
++import pytest
++from psycopg.rows import dict_row
++
++DB_URL = os.getenv("M3_TEST_DATABASE_URL")
++pytestmark = pytest.mark.skipif(not DB_URL, reason="M3_TEST_DATABASE_URL nicht gesetzt")
++
++KEY = "test-key"
++H = {"X-API-Key": KEY}
++FIXTURE = Path(__file__).resolve().parent / "fixtures" / "sbom_small.cdx.json"
++CVE_NPM = "CVE-2099-1001"     # axios < 1.6.5 (OSV npm), von einer Meldung genannt
++CVE_PYPI = "CVE-2099-1002"    # Django >= 4.0 < 4.2.7 (OSV PyPI), von keiner Meldung genannt
++CVE_DEB = "CVE-2099-1003"     # openssl (OSV Debian): Betriebssystempaket, wird nicht abgeglichen
++CSV = ("asset_key,name,asset_type,criticality,internet_exposed,product\n"
++       "host-01,Container-Host,container_host,4,true,Docker Engine\n")
++TRUNCATE = """TRUNCATE m3.evidence, m3.recommendations, m3.risk_assessments, m3.suppressions,
++              m3.matches, m3.processing, m3.sbom_components, m3.assets RESTART IDENTITY CASCADE"""
++
++
++@pytest.fixture(scope="module")
++def db():
++    conn = psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
++    conn.execute(TRUNCATE)
++    suffix = uuid.uuid4().hex[:8]
++    src = conn.execute("""INSERT INTO public.sources (name, url, connector, source_type)
++                          VALUES (%s, 'https://example.invalid', 'rss', 'authority') RETURNING id""",
++                       (f"m3-sbom-test-{suffix}",)).fetchone()["id"]
++    raw = conn.execute("""
++        INSERT INTO public.raw_items (source_id, external_id, url, title, body, title_de, body_de,
++                                      translation_status, cve_ids, content_hash)
++        VALUES (%s,%s,'https://example.invalid/axios','Luecke in axios','', 'Luecke in axios','',
++                'not_needed',%s,%s) RETURNING id""",
++        (src, f"axios-{suffix}", [CVE_NPM], uuid.uuid4().hex * 2)).fetchone()["id"]
++    conn.execute("INSERT INTO m2.summaries (raw_item_id, summary_text, category, model_name) "
++                 "VALUES (%s, 'axios', 'VULNERABILITY', 'test')", (raw,))
++    conn.execute("""INSERT INTO public.cve_facts (cve_id, cvss_score, cvss_version, kev_listed, epss_score)
++                    VALUES (%s, 7.5, '3.1', false, 0.3), (%s, 9.1, '3.1', false, 0.1), (%s, 7.0, '3.1', false, 0.1)""",
++                 (CVE_NPM, CVE_PYPI, CVE_DEB))
++    conn.execute("""INSERT INTO public.cve_affected (cve_id, data_source, ecosystem, package_name,
++                        version_start_including, version_end_excluding)
++                    VALUES (%s,'osv','npm','axios',NULL,'1.6.5'),
++                           (%s,'osv','PyPI','Django','4.0','4.2.7'),
++                           (%s,'osv','Debian:12','openssl',NULL,'3.0.13-1')""",
++                 (CVE_NPM, CVE_PYPI, CVE_DEB))
++    yield conn, raw
++    conn.execute(TRUNCATE)
++    conn.execute("DELETE FROM m2.summaries WHERE raw_item_id = %s", (raw,))
++    conn.execute("DELETE FROM public.cve_facts WHERE cve_id = ANY(%s)", ([CVE_NPM, CVE_PYPI, CVE_DEB],))
++    conn.execute("DELETE FROM public.raw_items WHERE source_id = %s", (src,))
++    conn.execute("DELETE FROM public.sources WHERE id = %s", (src,))
++    conn.close()
++
++
++@pytest.fixture(scope="module")
++def client(db):
++    from app import config
++    config.DATABASE_URL = DB_URL
++    config.INTERNAL_API_KEY = KEY
++    from fastapi.testclient import TestClient
++    from app.main import app
++    c = TestClient(app)
++    assert c.post("/import/assets", headers=H,
++                  files={"file": ("inventar.csv", CSV.encode(), "text/csv")}).status_code == 200
++    return c
++
++
++def sbom_upload(client, data: bytes, asset_key="host-01", name="sbom.json"):
++    return client.post(f"/import/sbom?asset_key={asset_key}", headers=H,
++                       files={"file": (name, data, "application/json")})
++
++
++def by_cve(conn, cve, view="findings_current"):
++    return conn.execute(f"SELECT * FROM m3.{view} WHERE cve_id = %s ORDER BY match_id", (cve,)).fetchall()
++
++
++def test_sbom_errors(client):
++    assert sbom_upload(client, FIXTURE.read_bytes(), asset_key="gibt-es-nicht").status_code == 404
++    assert sbom_upload(client, b'{"bomFormat": "SPDX"}').status_code == 422
++    assert sbom_upload(client, b"x", name="sbom.txt").status_code in (415, 422)
++
++
++def test_sbom_import(client, db):
++    conn, _ = db
++    r = sbom_upload(client, FIXTURE.read_bytes())
++    assert r.status_code == 200, r.text
++    s = r.json()
++    assert s["image_ref"] == "example/webapp:1.0" and s["unchanged"] is False
++    assert s["packages"] == 6 and s["packages_matchable"] == 4 and s["files_skipped"] == 1
++    img = conn.execute("SELECT * FROM m3.sbom_components WHERE component_type = 'container_image'").fetchone()
++    kids = conn.execute("SELECT count(*) AS n FROM m3.sbom_components WHERE parent_component_id = %s",
++                        (img["id"],)).fetchone()["n"]
++    assert kids == 6
++    assert sbom_upload(client, FIXTURE.read_bytes()).json()["unchanged"] is True   # gleiche Datei
++
++
++def test_osv_match_from_report_and_inventory(client, db):
++    conn, raw = db
++    r = client.post("/run", headers=H)
++    assert r.status_code == 200, r.text
++    npm = by_cve(conn, CVE_NPM)
++    assert len(npm) == 1 and npm[0]["raw_item_id"] == raw                     # Meldung; Inventarfund ausgeblendet
++    f = npm[0]
++    assert (f["match_method"], f["version_status"], f["is_direct"]) == ("purl_version", "affected", False)
++    assert f["dependency_path_names"] == ["example/webapp:1.0", "axios"]
++    ev = next(e for e in f["evidence"] if e["claim_key"] == "affected_version")
++    assert "laut OSV" in ev["claim_text"] and "example/webapp:1.0" in ev["claim_text"]
++    assert ev["source_url"] == f"https://osv.dev/vulnerability/{CVE_NPM}"
++
++    django = by_cve(conn, CVE_PYPI)                                          # PyPI-Name normalisiert
++    assert len(django) == 1 and django[0]["raw_item_id"] is None
++    assert by_cve(conn, CVE_DEB, "findings_history") == []                   # deb wird nicht abgeglichen
++
++
++def test_new_sbom_version_closes_old_package(client, db):
++    conn, _ = db
++    newer = FIXTURE.read_text(encoding="utf-8").replace("axios@1.6.0", "axios@1.6.8").replace('"1.6.0"', '"1.6.8"')
++    s = sbom_upload(client, newer.encode()).json()
++    assert s["components_deactivated"] == 1 and s["components_created"] == 1
++    client.post("/run", headers=H)
++    assert by_cve(conn, CVE_NPM) == []
++    reasons = {x["resolved_reason"] for x in by_cve(conn, CVE_NPM, "findings_history")}
++    assert reasons == {"component_removed"}
+-- 
+2.43.0
+

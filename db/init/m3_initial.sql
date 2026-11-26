@@ -84,6 +84,8 @@ CREATE TABLE m3.sbom_components (
     vendor_country      text        CHECK (vendor_country ~ '^[A-Z]{2}$'),      -- ISO 3166-1 alpha-2, fuer vendor_exposure
     cpe23               text        CHECK (cpe23 LIKE 'cpe:2.3:%'),
     purl                text        CHECK (purl LIKE 'pkg:%'),
+    osv_ecosystem       text,                                                   -- aus der purl abgeleitet, z. B. "npm", "PyPI", "Go"
+    osv_package         text,                                                   -- Paketname wie in OSV (PyPI normalisiert); NULL = nicht abgleichbar (z. B. deb/apk)
     image_ref           text,                                                   -- nur sbom, z. B. "n8nio/n8n:1.70.1"
     sbom_sha256         text        CHECK (sbom_sha256 ~ '^[0-9a-f]{64}$'),     -- nur sbom
     is_active           boolean     NOT NULL DEFAULT true,
@@ -112,6 +114,7 @@ CREATE INDEX sbom_components_asset_idx          ON m3.sbom_components (asset_id)
 CREATE INDEX sbom_components_parent_idx         ON m3.sbom_components (parent_component_id);
 CREATE INDEX sbom_components_vendor_product_idx ON m3.sbom_components (vendor_norm, product_norm);
 CREATE INDEX sbom_components_purl_idx           ON m3.sbom_components (purl);
+CREATE INDEX sbom_components_osv_idx            ON m3.sbom_components (osv_ecosystem, osv_package) WHERE is_active;
 
 CREATE TRIGGER sbom_components_touch_updated_at BEFORE UPDATE ON m3.sbom_components
     FOR EACH ROW EXECUTE FUNCTION m3.touch_updated_at();

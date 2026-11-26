@@ -160,7 +160,7 @@ def parse_csv(data: bytes) -> ParsedInventory:
         seen_products[dup_key] = rownum
 
         result.components[key].append({
-            "name": product, "vendor": vendor, "version": version, "vendor_norm": vendor_norm,
+            "row": rownum, "name": product, "vendor": vendor, "version": version, "vendor_norm": vendor_norm,
             "product_norm": product_norm, "component_type": comp_type, "vendor_country": country,
             "cpe23": cpe23,
         })
@@ -170,6 +170,33 @@ def parse_csv(data: bytes) -> ParsedInventory:
     if errors:
         raise CsvValidationError(f"{len(errors)} Fehler in der CSV-Datei, nichts gespeichert.", errors)
     return result
+
+
+def naming_warnings(conn, inv: ParsedInventory) -> list[dict[str, Any]]:
+    """Hinweise (keine Fehler): Hersteller/Produkt ohne cpe23, die in den NVD-Daten nie vorkommen.
+    Dann passt die Schreibweise vermutlich nicht zu NVD, und der Abgleich wuerde nichts finden."""
+    candidates = [(key, c) for key, comps in inv.components.items() for c in comps if not c["cpe23"]]
+    if not candidates:
+        return []
+    if conn.execute("SELECT NOT EXISTS (SELECT 1 FROM public.cve_affected WHERE data_source = 'nvd') AS empty"
+                    ).fetchone()["empty"]:
+        return [{"row": None, "asset_key": None, "message":
+                 "Noch keine NVD-Daten vorhanden, Pruefung der Produktnamen uebersprungen"}]
+    known = {(r["vendor"], r["product"]) for r in conn.execute("""
+        SELECT DISTINCT vendor, product FROM public.cve_affected
+         WHERE data_source = 'nvd' AND product = ANY(%s)""",
+        ([c["product_norm"] for _, c in candidates],)).fetchall()}
+    known_products = {p for _, p in known}
+    warnings = []
+    for key, c in candidates:
+        found = ((c["vendor_norm"], c["product_norm"]) in known if c["vendor_norm"]
+                 else c["product_norm"] in known_products)
+        if not found:
+            warnings.append({
+                "row": c["row"], "asset_key": key,
+                "message": f"'{c['vendor'] or ''} {c['name']}' kommt in den NVD-Daten nicht vor "
+                           f"(als '{c['vendor_norm'] or '-'}:{c['product_norm']}'). Schreibweise pruefen oder cpe23 angeben."})
+    return warnings
 
 
 def apply_inventory(conn, inv: ParsedInventory) -> dict[str, int]:

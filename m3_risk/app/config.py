@@ -14,6 +14,7 @@ RISK_POLICY_PATH = Path(os.getenv("M3_RISK_POLICY", Path(__file__).resolve().par
 
 # Grenzen fuer Uploads und Laeufe
 MAX_UPLOAD_BYTES = int(os.getenv("M3_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+MAX_SBOM_BYTES = int(os.getenv("M3_MAX_SBOM_BYTES", str(20 * 1024 * 1024)))   # Syft-SBOMs grosser Images: mehrere MB
 MAX_ATTEMPTS = max(1, int(os.getenv("M3_MAX_ATTEMPTS", "5")))      # fehlgeschlagene Meldungen nicht endlos wiederholen
 RUN_LIMIT = max(1, int(os.getenv("M3_RUN_LIMIT", "500")))          # hoechstens so viele Meldungen je /run
 

@@ -23,6 +23,7 @@ KEY = "test-key"
 H = {"X-API-Key": KEY}
 CVE_FW = "CVE-2099-0001"        # FortiOS, Bereich 7.2.0 bis < 7.2.7
 CVE_LIB = "CVE-2099-0002"       # Tomcat, Version im Inventar nicht vergleichbar
+CVE_INV = "CVE-2099-0003"       # FortiOS, Bereich 7.2.0 bis < 7.2.5, von keiner Meldung genannt
 
 HEADER = "asset_key,name,asset_type,criticality,internet_exposed,vendor,product,version,component_type,vendor_country\n"
 CSV_V1 = (HEADER
@@ -73,7 +74,7 @@ def db():
     conn.execute("DELETE FROM m2.entities WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
     conn.execute("DELETE FROM m2.trust_scores WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
     conn.execute("DELETE FROM m2.summaries WHERE raw_item_id = ANY(%s)", (list(ids.values()),))
-    conn.execute("DELETE FROM public.cve_facts WHERE cve_id = ANY(%s)", ([CVE_FW, CVE_LIB],))
+    conn.execute("DELETE FROM public.cve_facts WHERE cve_id = ANY(%s)", ([CVE_FW, CVE_LIB, CVE_INV],))
     conn.execute("DELETE FROM public.raw_items WHERE source_id = %s", (src,))
     conn.execute("DELETE FROM public.sources WHERE id = %s", (src,))
     conn.close()
@@ -236,6 +237,58 @@ def test_criticality_change_rescores_same_match(client, db):
     assert after["risk_score"] < before["risk_score"]
 
 
+# ---------------------------------------------------------------- Inventarfunde ohne Meldung
+
+def _by_cve(conn, cve, view="findings_current"):
+    return conn.execute(f"SELECT * FROM m3.{view} WHERE cve_id = %s ORDER BY match_id", (cve,)).fetchall()
+
+
+def test_inventory_scan_finds_known_cve_without_report(client, db):
+    conn, _ = db
+    upload(client, CSV_V1)                                   # Ausgangszustand: alle Assets aktiv, FortiOS 7.2.4
+    conn.execute("INSERT INTO public.cve_facts (cve_id, cvss_score, cvss_version, kev_listed, epss_score) "
+                 "VALUES (%s, 8.8, '3.1', true, 0.5)", (CVE_INV,))
+    conn.execute("""INSERT INTO public.cve_affected (cve_id, data_source, cpe, vendor, product,
+                        version_start_including, version_end_excluding)
+                    VALUES (%s,'nvd','cpe:2.3:o:fortinet:fortios:*:*:*:*:*:*:*:*','fortinet','fortios','7.2.0','7.2.5')""",
+                 (CVE_INV,))
+    r = client.post("/run", headers=H)
+    assert r.status_code == 200, r.text
+    rows = _by_cve(conn, CVE_INV)
+    assert [x["asset_key"] for x in rows] == ["fw-01"]                     # fw-02 hat 7.4.1 -> nicht betroffen
+    f = rows[0]
+    assert f["raw_item_id"] is None and f["title"].startswith("Bekannte Schwachstelle")
+    assert f["url"] == f"https://nvd.nist.gov/vuln/detail/{CVE_INV}"
+    assert f["risk_level"] in ("critical", "high")                         # KEV + Internet + sicher betroffen
+    assert "trust" in f["factor_breakdown"]["missing"]                     # ohne Meldung kein Trust-Score aus M2
+    assert {e["claim_key"] for e in f["evidence"]} >= {"affected_version", "asset", "cvss", "kev_listed"}
+
+
+def test_inventory_finding_hidden_when_report_names_same_cve(client, db):
+    conn, _ = db
+    hist = [x for x in _by_cve(conn, CVE_FW, "findings_history") if x["asset_key"] == "fw-01" and x["status"] == "open"]
+    assert sorted(x["raw_item_id"] is None for x in hist) == [False, True]  # Meldung + Inventarfund
+    cur = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"]
+    assert len(cur) == 1 and cur[0]["raw_item_id"] is not None            # nur einmal angezeigt
+
+
+def test_inventory_scan_ignores_unclear_versions(client, db):
+    conn, _ = db
+    rows = [x for x in _by_cve(conn, CVE_LIB, "findings_history") if x["raw_item_id"] is None]
+    assert rows == []                                                       # Tomcat "9.x-custom": kein Inventarfund
+
+
+def test_inventory_finding_resolved_after_update(client, db):
+    conn, _ = db
+    upload(client, CSV_V1.replace("FortiOS,7.2.4", "FortiOS,7.2.7"))
+    client.post("/run", headers=H)
+    assert _by_cve(conn, CVE_INV) == []
+    hist = _by_cve(conn, CVE_INV, "findings_history")
+    assert [(x["status"], x["resolved_reason"]) for x in hist] == [("resolved", "version_not_affected")]
+    upload(client, CSV_V1)                                                  # wieder zurueck fuer folgende Tests
+    client.post("/run", headers=H)
+
+
 def test_parallel_run_returns_409(client):
     from app import main
     assert main.RUN_MUTEX.acquire(blocking=False)
@@ -245,6 +298,39 @@ def test_parallel_run_returns_409(client):
         main.RUN_MUTEX.release()
 
 
-def test_not_yet_implemented_endpoints(client):
-    assert client.post("/import/sbom", headers=H).status_code == 501
-    assert client.post("/suppressions", headers=H).status_code == 501
+def test_naming_warnings_on_import(client, db):
+    r = upload(client, CSV_V1)
+    assert r.status_code == 200
+    warned = {w["asset_key"] for w in r.json()["warnings"]}
+    assert warned == {"ai-01"}            # qwen2.5 gibt es in NVD nicht; FortiOS und Tomcat (Alias apache) schon
+
+
+def test_suppression_closes_and_reopens(client, db):
+    conn, _ = db
+    client.post("/run", headers=H)
+    fw = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"][0]
+    body = {"component_id": fw["component_id"], "match_key": CVE_FW, "reason": "Funktion nicht aktiv",
+            "created_by": "analyst@test"}
+    r = client.post("/suppressions", headers=H, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] is True and r.json()["matches_resolved"] == 2   # Meldung + Inventarfund
+    assert client.post("/suppressions", headers=H, json=body).json()["created"] is False
+    assert [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"] == []
+    client.post("/run", headers=H)                                           # bleibt geschlossen
+    hist = [x for x in _by_cve(conn, CVE_FW, "findings_history") if x["asset_key"] == "fw-01"]
+    assert {x["resolved_reason"] for x in hist} == {"suppressed"}
+    listed = client.get("/suppressions", headers=H).json()
+    assert [s["match_key"] for s in listed] == [CVE_FW]
+
+    sid = r.json()["suppression_id"]
+    assert client.delete(f"/suppressions/{sid}", headers=H).status_code == 200
+    assert client.delete(f"/suppressions/{sid}", headers=H).status_code == 404
+    client.post("/run", headers=H)
+    reopened = [x for x in _by_cve(conn, CVE_FW) if x["asset_key"] == "fw-01"]
+    assert len(reopened) == 1 and reopened[0]["risk_assessment_id"] != fw["risk_assessment_id"]
+
+
+def test_suppression_unknown_component_404(client):
+    body = {"component_id": 999999, "match_key": CVE_FW, "reason": "x", "created_by": "y"}
+    assert client.post("/suppressions", headers=H, json=body).status_code == 404
+    assert client.post("/suppressions", json=body).status_code == 401
