@@ -5,8 +5,9 @@ Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehande
 
 > **Stand:** Datenbankschema, Schnittstelle und Kernlogik sind umgesetzt:
 > Inventar-Import (CSV), Abgleich über CVE und NVD-CPE (Wege 1 und 3), Risiko-Score, Belege, `/run`.
-> Dazu: Inventarfunde ohne Meldung, SBOM-Import mit Abgleich über purl/OSV (Weg 2), Fehlalarme, Namenshinweise beim Import.
-> **Folgt:** Abgleich ohne CVE (Wege 4 und 5), Empfehlungstexte per lokalem LLM.
+> Dazu: Inventarfunde ohne Meldung, SBOM-Import mit Abgleich über purl/OSV (Weg 2), Fehlalarme, Namenshinweise beim Import,
+> Handlungsempfehlungen je Zielgruppe (feste Bausteine + Einschätzung vom lokalen LLM, mit Prüfregeln und Mustertext).
+> **Folgt:** Abgleich ohne CVE (Wege 4 und 5).
 > Feedback zur Schnittstelle bitte direkt im PR, vor allem zu den Views für M4 (Abschnitt 5).
 
 ---
@@ -115,9 +116,10 @@ Gleiche Spalten, aber inklusive erledigter Treffer (`status = resolved`). Für V
 | `match_method`, `confidence`, `version_status`, `is_direct` | Wie sicher der Treffer ist |
 | `risk_score` (0-100), `risk_level` | `critical`, `high`, `medium`, `low`, `info` |
 | `action_code`, `deadline_at` | Maßnahme und Frist (regelbasiert) |
+| `manual_checks` | JSON-Liste `[{"code", "text"}]`: was ein Mensch prüfen muss (leer = nichts), siehe Abschnitt 8b |
 | `factor_breakdown` | Beitrag jedes Faktors zum Score (JSON), für die Begründung in der UI |
 | `assessed_at` | Zeitpunkt der Bewertung |
-| `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` |
+| `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` (Abschnitt 8b) |
 | `evidence` | JSON-Liste der Belege: `claim_key`, `claim_text`, `source_kind`, `raw_item_id`, `source_url` |
 
 **Benachrichtigung:** Ändern sich Eingangswerte (z. B. CVE neu in CISA KEV, neuer EPSS-Wert), legt M3 eine **neue**
@@ -143,7 +145,8 @@ Aufrufer sind nur n8n (`/run`) und M4 (Import, Fehlalarme). M3 ist von außen ni
 | DELETE | `/suppressions/{id}` | M4 | Markierung aufheben (wird nur deaktiviert) |
 
 ### `POST /run`
-Kein Body. Antwort: `{"processed": 12, "matched": 3, "no_match": 6, "skipped": 2, "failed": 1}`.
+Kein Body. Antwort: `{"processed": 12, "matched": 3, "no_match": 6, "skipped": 2, "failed": 1, "inventory": 4,
+"llm_passed": 2, "llm_fallback": 1, "llm_unavailable": 0}` (`llm_*` siehe Abschnitt 8b).
 Ein Fehler bei einer Meldung stoppt den Lauf nicht: sie wird `failed`, `attempts + 1`, und beim nächsten Lauf erneut versucht.
 
 ### `POST /import/assets` (CSV)
@@ -238,6 +241,33 @@ Mindeststufe `high`, wenn die CVE in KEV steht, das System aus dem Internet erre
 Frist je Stufe (24 h / 7 / 30 / 90 Tage), nie später als die KEV-Frist.
 Fehlende Werte zählen 0 und stehen in `factor_breakdown.missing`, damit die Oberfläche einen unvollständigen Score kennzeichnen kann.
 
+## 8b. Handlungsempfehlungen
+
+Je Bewertung drei Texte (`it_security`, `management`, `executive`) in `m3.recommendations`, in der View als `recommendations`.
+**Alles, was entscheidet, ist regelbasiert; das LLM formuliert nur die Einschätzung.**
+
+| Teil | Herkunft |
+|---|---|
+| Überschrift | fest je Stufe (`Sofort handeln`, `Dringend patchen`, `Patch einplanen`, ...); bei KEV „Sofort patchen – Schwachstelle wird aktiv ausgenutzt“ |
+| Maßnahmen | feste Sätze nach Regeln: Update auf die erste nicht betroffene Version, Image neu bauen (Abhängigkeit), Version prüfen, Internetzugang einschränken, Anzeichen einer Ausnutzung prüfen, ohne Fix: Herstellerhinweise/Workaround |
+| Frist, Betroffen, CVSS/EPSS/KEV | aus der Bewertung |
+| **Manuelle Prüfung nötig** | feste Sätze, auch als `manual_checks` in der View: Version nicht vergleichbar, Treffer nur über Namen, nur über Abhängigkeit betroffen, Meldung unbestätigt/widersprüchlich, kein CVSS |
+| Einschätzung (1-3 Sätze) | lokales LLM (`LLM_MODEL`, Standard `qwen2.5:7b`), sonst Mustertext |
+
+Ablauf: Jede neue Bewertung bekommt sofort Mustertexte (`validation_status = fallback_template`). Am Ende von `/run`
+lässt M3 höchstens `M3_LLM_LIMIT` (10) sichtbare Treffer der Stufen `M3_LLM_LEVELS` (`critical,high,medium`) vom LLM
+formulieren, höchste Punktzahl zuerst; Timeout `M3_LLM_TIMEOUT` (60 s). Ist Ollama nicht erreichbar, bleiben die
+Mustertexte (`validation_errors = ["llm_unavailable"]`) und der nächste `/run` versucht es erneut.
+Ausschalten: `M3_LLM_ENABLED=false`.
+
+Das LLM bekommt nur ein festes Faktenpaket (`fact_package`, gespeichert) und **keinen Freitext aus Meldungen**
+(Schutz vor Prompt-Injection). Die Antwort wird verworfen (Mustertext, Fehler in `validation_errors`), wenn sie
+- kein JSON mit allen drei Texten ist oder zu lang ist,
+- eine CVE, Zahl, Version oder ein Datum enthält, das nicht im Faktenpaket steht,
+- einen Link enthält,
+- aktive Ausnutzung behauptet, obwohl die CVE nicht in KEV steht, oder „kritisch“ schreibt, obwohl die Stufe niedriger ist.
+Eine abgelehnte Antwort wird nicht erneut angefragt; eine neue Bewertung startet den Ablauf neu.
+
 ## 9. Neubewertung und Lebenszyklus
 
 **Fingerabdrücke statt Zeitstempel.** Für jede Meldung speichert `m3.processing` zwei Hashes über die
@@ -268,7 +298,7 @@ geändert -> neuer Abgleich ergibt „nicht betroffen“ -> Treffer `resolved` m
 
 - Inventar, Software und SBOMs liegen nur in der lokalen Datenbank.
 - M3 ruft **keine externen Dienste** auf. Alle externen Informationen kommen bereits aufbereitet von M1.
-- Für Empfehlungstexte (PR 4) wird nur das lokale Ollama genutzt, und das Modell erhält nur ein festes
+- Für Empfehlungstexte (Abschnitt 8b) wird nur das lokale Ollama genutzt, und das Modell erhält nur ein festes
   Faktenpaket. Maßnahme und Frist berechnet M3 regelbasiert, das LLM formuliert nur.
 - Fehlermeldungen enthalten keine Inventardaten.
 
@@ -317,7 +347,9 @@ nur gegen die lokale Entwicklungsdatenbank laufen lassen. Geprüft werden u. a.:
 Treffer und Nicht-Treffer nach Version, Neubewertung bei KEV-Änderung (neue `risk_assessment_id`),
 Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409,
 Inventarfunde ohne Meldung, Namenshinweise, Fehlalarm markieren und aufheben,
-SBOM-Import (`tests/test_sbom_integration.py`): purl/OSV-Treffer mit Pfad, PyPI-Namen, deb nicht abgeglichen, neue SBOM-Version.
+SBOM-Import (`tests/test_sbom_integration.py`): purl/OSV-Treffer mit Pfad, PyPI-Namen, deb nicht abgeglichen, neue SBOM-Version,
+Empfehlungen (`tests/test_recommend.py`, Ollama simuliert): feste Bausteine, manuelle Prüfung, jede Prüfregel,
+kein Meldungstext im Faktenpaket, Ollama nicht erreichbar, abgelehnte Antwort -> Mustertext.
 
 ## 13. Offene Punkte
 

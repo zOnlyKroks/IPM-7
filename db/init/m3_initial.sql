@@ -213,6 +213,8 @@ CREATE TABLE m3.risk_assessments (
     trust_label       text         CHECK (trust_label IN ('CONFIRMED', 'UNCONFIRMED', 'CONTRADICTORY')),
     category          text         NOT NULL,         -- M2 summaries.category zum Bewertungszeitpunkt
     factor_breakdown  jsonb        NOT NULL CHECK (jsonb_typeof(factor_breakdown) = 'object'),
+    -- Faelle, die ein Mensch pruefen muss: [{"code": "version_unknown", "text": "..."}], leer = keine
+    manual_checks     jsonb        NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(manual_checks) = 'array'),
     risk_fingerprint  text         NOT NULL,
     assessed_at       timestamptz  NOT NULL DEFAULT now(),
     -- vendor_exposure ist hoechstens medium (kein CVSS/KEV/EPSS, Namensabgleich)
@@ -322,6 +324,7 @@ SELECT
     ra.risk_level,
     ra.action_code,
     ra.deadline_at,
+    ra.manual_checks,
     ra.factor_breakdown,
     ra.assessed_at,
     (SELECT jsonb_object_agg(rec.audience, rec.text)

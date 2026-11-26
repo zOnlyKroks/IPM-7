@@ -67,6 +67,7 @@ def client(db):
     from app import config
     config.DATABASE_URL = DB_URL
     config.INTERNAL_API_KEY = KEY
+    config.LLM_ENABLED = False             # kein Ollama im Test; LLM-Teil siehe test_recommend.py
     from fastapi.testclient import TestClient
     from app.main import app
     c = TestClient(app)

@@ -18,6 +18,14 @@ MAX_SBOM_BYTES = int(os.getenv("M3_MAX_SBOM_BYTES", str(20 * 1024 * 1024)))   # 
 MAX_ATTEMPTS = max(1, int(os.getenv("M3_MAX_ATTEMPTS", "5")))      # fehlgeschlagene Meldungen nicht endlos wiederholen
 RUN_LIMIT = max(1, int(os.getenv("M3_RUN_LIMIT", "500")))          # hoechstens so viele Meldungen je /run
 
+# Handlungsempfehlungen (README Abschnitt 8). Nur lokales Ollama; ohne Ollama bleiben die Mustertexte.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
+LLM_ENABLED = os.getenv("M3_LLM_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+LLM_TIMEOUT = float(os.getenv("M3_LLM_TIMEOUT", "60"))                     # Sekunden je Aufruf
+LLM_LIMIT = max(1, int(os.getenv("M3_LLM_LIMIT", "10")))                   # hoechstens so viele LLM-Aufrufe je /run
+LLM_LEVELS = tuple(x.strip() for x in os.getenv("M3_LLM_LEVELS", "critical,high,medium").split(",") if x.strip())
+
 # PostgreSQL-Advisory-Lock fuer /run (M2 nutzt 42002002)
 ADVISORY_LOCK_ID = 42003003
 

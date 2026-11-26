@@ -17,7 +17,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from . import config
+from . import config, recommend
 from .matching import Candidate, match_cves
 from .risk import Policy, RiskInput, score
 
@@ -301,10 +301,14 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
         )
         fp = fingerprint({"logic": config.MATCH_LOGIC_VERSION, "policy": policy.version, "input": inp.__dict__,
                           "method": m["match_method"], "category": item["category"],
-                          "trust_label": item["trust_label"]})
+                          "trust_label": item["trust_label"], "is_direct": m["is_direct"],
+                          "fixed": recommend.fixed_version(m["match_details"]), "rec": recommend.PROMPT_VERSION})
         if fp == m["current_fp"] and m["id"] not in force:
             continue
         r = score(inp, policy, now)
+        checks = recommend.manual_checks(version_status=m["version_status"], match_method=m["match_method"],
+                                         is_direct=m["is_direct"], trust_label=item["trust_label"],
+                                         cvss_score=inp.cvss_score, kev_listed=inp.kev_listed)
         if m["current_id"]:
             conn.execute("UPDATE m3.risk_assessments SET is_current=false WHERE id=%s", (m["current_id"],))
         new_id = conn.execute("""
@@ -312,14 +316,18 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
               (match_id, scoring_branch, score, risk_level, action_code, deadline_at, policy_version,
                cvss_score, cvss_version, kev_listed, kev_due_date, epss_score, asset_criticality,
                internet_exposed, match_confidence, trust_score, trust_label, category, factor_breakdown,
-               risk_fingerprint, assessed_at)
-            VALUES (%s,'cve',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+               manual_checks, risk_fingerprint, assessed_at)
+            VALUES (%s,'cve',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (m["id"], r.score, r.risk_level, r.action_code, r.deadline_at, policy.version,
              inp.cvss_score, fact["cvss_version"] if fact else None, inp.kev_listed, inp.kev_due_date,
              inp.epss_score, inp.asset_criticality, inp.internet_exposed, inp.match_confidence,
              inp.trust_score, item["trust_label"], item["category"], Jsonb(_jsonable(r.factor_breakdown)),
-             fp, now)).fetchone()["id"]
+             Jsonb(checks), fp, now)).fetchone()["id"]
         _evidence(conn, new_id, item, m, fact)
+        assessment = {"risk_level": r.risk_level, "score": r.score, "deadline_at": r.deadline_at,
+                      "kev_listed": inp.kev_listed, "kev_due_date": inp.kev_due_date, "cvss_score": inp.cvss_score,
+                      "epss_score": inp.epss_score, "trust_label": item["trust_label"]}
+        recommend.write_templates(conn, new_id, _jsonable(recommend.build_facts(m, assessment, checks)))
         created += 1
     return created
 
@@ -421,4 +429,5 @@ def run(conn, policy: Policy) -> dict[str, int]:
                     (it["id"], it["category"], mfp, rfp, f"{type(exc).__name__}: {exc}"[:500]))
     with conn.transaction():
         stats["inventory"] = scan_inventory(conn, policy, now)
+    stats.update(recommend.refine_with_llm(conn))
     return stats
