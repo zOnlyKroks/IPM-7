@@ -15,7 +15,8 @@ n8n import:credentials --input=/tmp/credentials.json || echo "WARNUNG: Import de
 if ls /workflows/*.json >/dev/null 2>&1; then
   n8n import:workflow --separate --input=/workflows || echo "WARNUNG: Import der Workflows fehlgeschlagen"
   for f in /workflows/*.json; do
-    id=$(sed -n 's/^  "id": *"\([^"]*\)",\{0,1\} *$/\1/p' "$f" | head -n 1)
+    # tr: unter Windows checkt Git die JSON-Dateien evtl. mit CRLF aus, sonst findet sed keine ID
+    id=$(tr -d '\r' < "$f" | sed -n 's/^  "id": *"\([^"]*\)",\{0,1\} *$/\1/p' | head -n 1)
     if [ -n "$id" ]; then
       n8n publish:workflow --id="$id" || echo "WARNUNG: Workflow $id konnte nicht veroeffentlicht werden"
     else
