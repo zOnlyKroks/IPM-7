@@ -25,9 +25,9 @@ Schema: `db/init/m1_initial.sql`. M1 schreibt `raw_items`, `fetch_runs`, `cve_fa
 |---|---|---|---|
 | `rss` | RSS/Atom-Feed | `raw_items` | `max_items` (200) |
 | `cisa_kev` | KEV-JSON-Katalog | `cve_facts.kev_*` | |
-| `nvd` | NVD API 2.0 (inkrementell per `lastModified`) | `cve_facts`, `cve_affected` | `initial_days` (7), `page_size` (2000) |
+| `nvd` | NVD API 2.0: Aenderungen per `lastModified`, dazu gezielt CVEs aus Meldungen und KEV | `cve_facts`, `cve_affected` | `initial_days` (7), `page_size` (2000), `lookup_batch` (20, mit Key 100) |
 | `epss` | EPSS-CSV (gzip) | `cve_facts.epss_*`, nur bekannte CVEs | |
-| `osv` | OSV je neu aufgetauchter CVE | `cve_affected` (`osv`) | `batch` (200) |
+| `osv` | OSV je neu aufgetauchter CVE, Pakete aus den Alias-Eintraegen (GHSA u. a.) | `cve_affected` (`osv`) | `batch` (200) |
 
 `sources.url` ist die Abruf-URL (bei `nvd`, `cisa_kev`, `epss`, `osv` die jeweilige API-/Datei-URL;
 die Standardwerte stehen in den Connectors und gelten nur bei leerem String).
@@ -59,3 +59,16 @@ python -m pytest
 ```
 
 Die Tests decken Parser, Normalisierung, Retry und Textaufteilung ab, nicht die Datenbankzugriffe.
+
+## Voller NVD-Bestand
+
+Der normale Abruf kennt nur kuerzlich geaenderte, KEV- und in Meldungen genannte CVEs. Alle rund 430 000
+laedt einmalig `docker compose exec m1 python -m app.nvd_mirror` (1-2 GB Datenbank, fortsetzbar).
+M1 startet diesen Import beim Start selbst, solange er noch nie fertig wurde (`M1_NVD_MIRROR=0` schaltet
+das ab); bis dahin pausiert der normale NVD-Abruf.
+
+## Social-Media-Quellen
+
+Ueber den `rss`-Connector mit `source_type = 'social'` und niedrigem `trust_weight`, z. B. Mastodon-Hashtags:
+`https://mastodon.social/tags/cve.rss`. Reddit blockt anonyme Abrufe (braucht eine registrierte API-App),
+X hat keine kostenlose API; beide sind nicht angebunden.

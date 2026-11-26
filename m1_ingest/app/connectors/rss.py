@@ -21,11 +21,16 @@ def parse_feed(content: bytes, source: dict) -> list[RawItem]:
             html = e["content"][0].get("value", "")
         else:
             html = e.get("summary", "")
+        body = strip_html(html)
         ts = e.get("published_parsed") or e.get("updated_parsed")
         published = datetime.fromtimestamp(calendar.timegm(ts), timezone.utc) if ts else None
         external_id = e.get("id") or e.get("link") or f"{title}|{published}"
+        if not title and body:
+            # Social-Beitraege (z. B. Mastodon) haben keinen Titel: erste Zeile, gekuerzt
+            first = body.split("\n", 1)[0]
+            title = first if len(first) <= 120 else first[:117].rstrip() + "..."
         items.append(RawItem(external_id=external_id, url=link, title=title,
-                             body=strip_html(html), published_at=published))
+                             body=body, published_at=published))
     return items
 
 
