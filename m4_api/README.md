@@ -62,7 +62,7 @@ M3 wird ausschliesslich ueber die Views `m3.findings_current`, `m3.findings_hist
 | `recipient_groups`, `recipients` | Empfaenger je Zielgruppe (`it_security`, `management`, `executive`) |
 | `notification_rules` | Risikostufe -> Gruppe, Kanal, sofort/taeglich/woechentlich |
 | `notification_log` | Versandprotokoll (im Arbeitspaket `notifications`) |
-| `item_status` | Bearbeitungsstatus je Meldung (im Arbeitspaket `alert_status`) |
+| `item_status` | Bearbeitungsstatus je Meldung bzw. Inventarfund (im Arbeitspaket `alert_status`) |
 | `audit_log` | Aenderungsprotokoll, nur anhaengen |
 
 **Genau einmal benachrichtigen:** M3 legt bei jeder Aenderung der Eingangswerte (z. B. neuer EPSS-Wert)
@@ -76,6 +76,15 @@ docker compose up -d postgres
 docker compose exec -T postgres psql -U argos -d argos -v ON_ERROR_STOP=1 < m4_api/tests/m4_schema_smoke.sql
 ```
 Erwartet: `NOTICE:  M4 smoke test OK`.
+
+### Inventarfunde ohne Meldung
+
+M3 liefert auch Funde ohne Meldung (`raw_item_id IS NULL`). `notification_log.raw_item_id` darf deshalb leer sein,
+`item_status` haengt dann an `match_id` statt an der Meldung.
+
+**Regel fuer `/notify` (noch umzusetzen):** Sofort wird nur gemeldet, wenn `findings_current.immediate_notify` wahr ist.
+Das ist bei Meldungstreffern immer so, bei Inventarfunden nur ab `high` oder bei KEV. Der volle NVD-Bestand kann
+in einem Lauf viele alte CVEs liefern; die uebrigen erscheinen nur in Uebersicht und Bericht.
 
 ### Bestehende Datenbank: m4_initial.sql nachladen
 

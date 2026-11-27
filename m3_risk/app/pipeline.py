@@ -183,14 +183,20 @@ def _resolve_reason(conn, row, not_affected: set, suppressed: set) -> str:
     return "advisory_changed"
 
 
-def reconcile_matches(conn, raw_item_id: int, candidates: dict[tuple[int, str], Candidate],
+def _of_item(column: str, raw_item_id: int | None) -> tuple[str, tuple]:
+    """WHERE-Teil fuer die Treffer einer Meldung bzw. (None) die Inventarfunde ohne Meldung."""
+    return (f"{column} IS NULL", ()) if raw_item_id is None else (f"{column} = %s", (raw_item_id,))
+
+
+def reconcile_matches(conn, raw_item_id: int | None, candidates: dict[tuple[int, str], Candidate],
                       not_affected: set) -> set[int]:
     """Gleicht Treffer ab und gibt die IDs wieder geoeffneter Treffer zurueck."""
     suppressed = _active_suppressions(conn)
     reopened: set[int] = set()
     wanted = {k: c for k, c in candidates.items() if k not in suppressed}
+    where, params = _of_item("raw_item_id", raw_item_id)
     existing = {(r["component_id"], r["match_key"]): r for r in conn.execute(
-        "SELECT * FROM m3.matches WHERE raw_item_id = %s FOR UPDATE", (raw_item_id,)).fetchall()}
+        f"SELECT * FROM m3.matches WHERE {where} FOR UPDATE", params).fetchall()}
 
     for key, row in existing.items():
         if key not in wanted and row["status"] == "open":
@@ -221,7 +227,9 @@ def reconcile_matches(conn, raw_item_id: int, candidates: dict[tuple[int, str], 
 # ---------------------------------------------------------------- Bewerten und belegen
 
 def _evidence(conn, assessment_id: int, item, m, fact) -> None:
-    rows = [("report", f"Meldung: {item['title']}", "raw_item", item["id"], item["url"], None)]
+    rows = []
+    if item["id"] is not None:
+        rows.append(("report", f"Meldung: {item['title']}", "raw_item", item["id"], item["url"], None))
     rule = (m["match_details"].get("rules") or [{}])[0]
     bounds = ", ".join(f"{k.replace('version_', '')}={v}" for k, v in rule.items() if k.startswith("version_"))
     version = m["match_details"].get("component_version") or "unbekannt"
@@ -258,7 +266,8 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
     """Bewertet alle offenen Treffer der Meldung. Neue Zeile nur, wenn sich Eingaben geaendert haben
     oder der Treffer wieder geoeffnet wurde (neue ID -> M4 benachrichtigt erneut)."""
     created = 0
-    matches = conn.execute("""
+    where, params = _of_item("m.raw_item_id", item["id"])
+    matches = conn.execute(f"""
         SELECT m.*, c.name AS component_name, a.id AS asset_id, a.asset_key, a.name AS asset_name,
                a.criticality, a.internet_exposed,
                ra.id AS current_id, ra.risk_fingerprint AS current_fp
@@ -266,8 +275,8 @@ def assess_matches(conn, item, facts: dict, policy: Policy, now: datetime, force
           JOIN m3.sbom_components c ON c.id = m.component_id
           JOIN m3.assets a ON a.id = c.asset_id
           LEFT JOIN m3.risk_assessments ra ON ra.match_id = m.id AND ra.is_current
-         WHERE m.raw_item_id = %s AND m.status = 'open'
-    """, (item["id"],)).fetchall()
+         WHERE {where} AND m.status = 'open'
+    """, params).fetchall()
     for m in matches:
         fact = facts.get(m["cve_id"])
         inp = RiskInput(
@@ -331,6 +340,30 @@ def process_item(conn, item, facts, policy: Policy, match_fp: str, risk_fp: str,
     return status
 
 
+INVENTORY_ITEM = {"id": None, "title": None, "url": None, "category": "VULNERABILITY",
+                  "trust_score": None, "trust_label": None}
+
+
+def scan_inventory(conn, policy: Policy, now: datetime) -> int:
+    """Bekannte Schwachstellen der Inventar-Software, auch ohne Meldung. Nur sicher betroffene
+    Versionen: bei unklarer Version waere sonst jede CVE eines Produkts ein Fund.
+    Rueckgabe: Anzahl offener Inventarfunde."""
+    cves = [r["cve_id"] for r in conn.execute("""
+        SELECT DISTINCT ca.cve_id
+          FROM public.cve_affected ca
+          JOIN m3.sbom_components c ON c.vendor_norm = ca.vendor AND c.product_norm = ca.product AND c.is_active
+          JOIN m3.assets a ON a.id = c.asset_id AND a.is_active
+         WHERE ca.data_source = 'nvd'
+    """).fetchall()]
+    result = match_cves(conn, cves)
+    affected = {k: c for k, c in result.candidates.items() if c.version_status == "affected"}
+    reopened = reconcile_matches(conn, None, affected, result.not_affected)
+    facts, _ = load_cve_data(conn, sorted({c.cve_id for c in affected.values()}))
+    assess_matches(conn, INVENTORY_ITEM, facts, policy, now, force=reopened)
+    return conn.execute(
+        "SELECT count(*) AS n FROM m3.matches WHERE raw_item_id IS NULL AND status = 'open'").fetchone()["n"]
+
+
 def run(conn, policy: Policy) -> dict[str, int]:
     """conn muss autocommit=True sein; jede Meldung bekommt ihre eigene Transaktion."""
     stats = {"processed": 0, "matched": 0, "no_match": 0, "skipped": 0, "failed": 0}
@@ -367,4 +400,6 @@ def run(conn, policy: Policy) -> dict[str, int]:
                                       THEN m3.processing.attempts + 1 ELSE 1 END,
                         last_error=EXCLUDED.last_error, processed_at=now()""",
                     (it["id"], it["category"], mfp, rfp, f"{type(exc).__name__}: {exc}"[:500]))
+    with conn.transaction():
+        stats["inventory"] = scan_inventory(conn, policy, now)
     return stats

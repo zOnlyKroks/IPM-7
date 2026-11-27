@@ -79,6 +79,12 @@ Konzept, nicht in den Prototyp.
   und einen `dependency_path` vom Image bis zur betroffenen Komponente.
 - Kombinationen, die als Fehlalarm markiert sind (`m3.suppressions`), werden übersprungen.
 
+### Inventarfunde ohne Meldung
+Jeder `/run` gleicht zusätzlich das Inventar direkt gegen `cve_affected` (NVD) ab, auch wenn keine Meldung die CVE nennt.
+Diese Treffer haben `raw_item_id = NULL`, keinen Trust-Score (Faktor fehlt) und die Kategorie `VULNERABILITY`.
+Es zählen nur sicher betroffene Versionen. Nennt eine Meldung dieselbe CVE, entsteht dafür ein eigener Treffer, und `findings_current` blendet den Inventarfund aus.
+Die Antwort von `/run` enthält `inventory` = Anzahl offener Inventarfunde.
+
 ## 5. Ausgabe für M4 (Views, nur lesen)
 
 M4 liest **nur diese Views** und keine internen Tabellen. Intern kann sich M3 ändern,
@@ -106,6 +112,7 @@ Gleiche Spalten, aber inklusive erledigter Treffer (`status = resolved`). Für V
 | `action_code`, `deadline_at` | Maßnahme und Frist (regelbasiert) |
 | `factor_breakdown` | Beitrag jedes Faktors zum Score (JSON), für die Begründung in der UI |
 | `assessed_at` | Zeitpunkt der Bewertung |
+| `immediate_notify` | `false` bei Inventarfunden unter `high` ohne KEV: nicht sofort benachrichtigen, nur Übersicht/Bericht |
 | `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` |
 | `evidence` | JSON-Liste der Belege: `claim_key`, `claim_text`, `source_kind`, `raw_item_id`, `source_url` |
 

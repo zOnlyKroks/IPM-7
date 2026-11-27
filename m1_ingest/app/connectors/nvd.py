@@ -1,14 +1,19 @@
 """NVD CVE API 2.0 -> cve_facts (NVD-Felder) und cve_affected (data_source 'nvd').
+Je Lauf: (1) Aenderungen seit dem letzten Lauf, (2) CVEs aus Meldungen ohne NVD-Daten, (3) KEV-CVEs.
 fetch_state: last_modified (Ende des zuletzt abgefragten Fensters).
-source.config: initial_days (Standard 7), page_size (Standard 2000)."""
+source.config: initial_days (7), page_size (2000), lookup_batch (20, mit NVD_API_KEY 100)."""
+import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 from .. import facts
 from ..config import settings
+from ..httpclient import FetchError
 from ..models import FetchResult
 
+log = logging.getLogger("m1.nvd")
 DEFAULT_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MAX_WINDOW = timedelta(days=120)   # NVD erlaubt hoechstens 120 Tage je Abfrage
 _SEVERITIES = {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
@@ -86,6 +91,85 @@ def _fmt(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
 
 
+def _store(conn, vulns: list[dict]) -> int:
+    for v in vulns:
+        rec, affected = parse_cve(v)
+        facts.upsert_nvd(conn, rec)
+        facts.replace_affected(conn, rec["cve_id"], "nvd", affected)
+    # Seitenweise speichern: kurze Sperren (RSS legt parallel cve_facts-Zeilen an),
+    # und ein spaeterer Fehler verwirft nicht alles
+    conn.commit()
+    return len(vulns)
+
+
+def _client(source: dict, http):
+    """Liefert get(query) mit API-Schluessel und Pause zwischen den Anfragen (Rate-Limit)."""
+    key = settings().nvd_api_key
+    headers = {"apiKey": key} if key else {}
+    pause = 0.7 if key else 6.5   # NVD: 50 Anfragen/30 s mit, 5/30 s ohne Schluessel
+    base = source["url"] or DEFAULT_URL
+    sent = False
+
+    def get(query: str) -> dict:
+        nonlocal sent
+        if sent:
+            time.sleep(pause)
+        sent = True
+        # Query als Text: hasKev ist ein Parameter ohne Wert
+        return http.get(f"{base}?{query}", headers=headers).json()
+    return get
+
+
+def _paged(get, query: str, page_size: int):
+    index, total = 0, None
+    while total is None or index < total:
+        data = get(f"{query}&resultsPerPage={page_size}&startIndex={index}")
+        total = int(data.get("totalResults", 0))
+        vulns = data.get("vulnerabilities", [])
+        if not vulns:
+            break
+        yield vulns
+        index += len(vulns)
+
+
+def _missing_article_cves(conn, limit: int) -> list[str]:
+    """CVEs aus Meldungen ohne NVD-Daten, neueste Meldung zuerst. Unbekannte erst nach einem Tag erneut."""
+    rows = conn.execute(
+        """
+        SELECT f.cve_id
+        FROM cve_facts f
+        JOIN (SELECT unnest(cve_ids) AS cve, max(fetched_at) AS seen FROM raw_items GROUP BY 1) r
+          ON r.cve = f.cve_id
+        WHERE f.nvd_checked_at IS NULL
+           OR (f.nvd_status IS NULL AND f.nvd_checked_at < now() - interval '1 day')
+        ORDER BY r.seen DESC, f.cve_id LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+    return [r["cve_id"] for r in rows]
+
+
+def _lookup(conn, get, cve_ids: list[str]) -> int:
+    found = 0
+    for cve_id in cve_ids:
+        vulns = get(f"cveId={cve_id}").get("vulnerabilities", [])
+        if vulns:
+            found += _store(conn, vulns)
+        else:
+            conn.execute("UPDATE cve_facts SET nvd_checked_at = now() WHERE cve_id = %s", (cve_id,))
+    return found
+
+
+def _backfill_kev(conn, get, page_size: int) -> int:
+    """Alle KEV-CVEs auf einmal laden, sobald eine davon noch nie bei NVD nachgeschlagen wurde."""
+    if not conn.execute("SELECT 1 FROM cve_facts WHERE kev_listed AND nvd_checked_at IS NULL LIMIT 1").fetchone():
+        return 0
+    n = sum(_store(conn, vulns) for vulns in _paged(get, "hasKev", page_size))
+    # Was NVD (noch) nicht als KEV fuehrt, soll nicht bei jedem Lauf alles neu laden
+    conn.execute("UPDATE cve_facts SET nvd_checked_at = now() WHERE kev_listed AND nvd_checked_at IS NULL")
+    return n
+
+
 def fetch(source: dict, state: dict | None, http, conn) -> FetchResult:
     cfg = source.get("config") or {}
     end = datetime.now(timezone.utc)
@@ -93,26 +177,18 @@ def fetch(source: dict, state: dict | None, http, conn) -> FetchResult:
     start = last or end - timedelta(days=int(cfg.get("initial_days", 7)))
     start = max(start, end - MAX_WINDOW)
     page_size = int(cfg.get("page_size", 2000))
-    key = settings().nvd_api_key
-    headers = {"apiKey": key} if key else {}
-    pause = 0.7 if key else 6.5   # NVD: 50 Anfragen/30 s mit, 5/30 s ohne Schluessel
+    batch = int(cfg.get("lookup_batch", 100 if settings().nvd_api_key else 20))
+    get = _client(source, http)
 
-    index, total, changed = 0, None, 0
-    while total is None or index < total:
-        if index:
-            time.sleep(pause)
-        resp = http.get(source["url"] or DEFAULT_URL, headers=headers, params={
-            "lastModStartDate": _fmt(start), "lastModEndDate": _fmt(end),
-            "resultsPerPage": page_size, "startIndex": index})
-        data = resp.json()
-        total = int(data.get("totalResults", 0))
-        vulns = data.get("vulnerabilities", [])
-        if not vulns:
-            break
-        for v in vulns:
-            rec, affected = parse_cve(v)
-            facts.upsert_nvd(conn, rec)
-            facts.replace_affected(conn, rec["cve_id"], "nvd", affected)
-            changed += 1
-        index += len(vulns)
-    return FetchResult(state={"last_modified": _fmt(end)}, seen=total or 0, changed=changed)
+    # 1. Aenderungen seit dem letzten Lauf
+    window = urlencode({"lastModStartDate": _fmt(start), "lastModEndDate": _fmt(end)})
+    changed = sum(_store(conn, vulns) for vulns in _paged(get, window, page_size))
+
+    # 2. Gezielt nachladen, was M3 braucht. Ein HTTP-Fehler hier verwirft die Ergebnisse oben nicht,
+    #    der naechste Lauf holt den Rest nach.
+    try:
+        changed += _lookup(conn, get, _missing_article_cves(conn, batch))
+        changed += _backfill_kev(conn, get, page_size)
+    except FetchError as exc:
+        log.warning("NVD-Nachladen abgebrochen: %s", exc)
+    return FetchResult(state={"last_modified": _fmt(end)}, seen=changed, changed=changed)

@@ -73,6 +73,32 @@ BEGIN
     END;
     UPDATE m4.notification_log SET status = 'sent', sent_at = now() WHERE risk_assessment_id = 800001 AND kind = 'alert';
 
+    -- Inventarfund ohne Meldung: Versand und Status sind moeglich, Doppelversand bleibt verhindert
+    INSERT INTO m4.notification_log(match_id,risk_assessment_id,risk_level,recipient_id,channel)
+      VALUES (900002,800002,'high',rc1,'email');
+    BEGIN
+        INSERT INTO m4.notification_log(match_id,risk_assessment_id,risk_level,recipient_id,channel)
+          VALUES (900002,800002,'high',rc1,'email');
+        RAISE EXCEPTION 'duplicate inventory notification accepted';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+    INSERT INTO m4.item_status(match_id,status,updated_by) VALUES (900002,'irrelevant',u1);
+    BEGIN
+        INSERT INTO m4.item_status(match_id,status) VALUES (900002,'done');
+        RAISE EXCEPTION 'two states for one finding accepted';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+    BEGIN
+        INSERT INTO m4.item_status(status) VALUES ('new');
+        RAISE EXCEPTION 'item status without target accepted';
+    EXCEPTION WHEN check_violation THEN NULL;
+    END;
+    BEGIN
+        INSERT INTO m4.item_status(raw_item_id,match_id) VALUES (r1,900003);
+        RAISE EXCEPTION 'item status with two targets accepted';
+    EXCEPTION WHEN check_violation THEN NULL;
+    END;
+
     -- item_status
     INSERT INTO m4.item_status(raw_item_id,status,updated_by) VALUES (r1,'in_progress',u1);
     BEGIN

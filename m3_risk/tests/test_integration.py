@@ -119,7 +119,7 @@ def test_import_and_first_run(client, db):
 
     r = client.post("/run", headers=H)
     assert r.status_code == 200, r.text
-    assert r.json() == {"processed": 3, "matched": 2, "no_match": 0, "skipped": 1, "failed": 0}
+    assert r.json() == {"processed": 3, "matched": 2, "no_match": 0, "skipped": 1, "failed": 0, "inventory": 1}
 
     f = findings(conn)
     assert set(f) == {"fw-01", "web-01"}                     # fw-02 hat 7.4.1 -> nicht betroffen
