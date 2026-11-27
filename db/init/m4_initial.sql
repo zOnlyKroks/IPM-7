@@ -190,7 +190,7 @@ CREATE TABLE m4.notification_log (
         CHECK (kind IN ('alert', 'resolved')),
     match_id           bigint      NOT NULL,
     risk_assessment_id bigint      NOT NULL,
-    raw_item_id        bigint      NOT NULL REFERENCES public.raw_items (id) ON DELETE RESTRICT,
+    raw_item_id        bigint      REFERENCES public.raw_items (id) ON DELETE RESTRICT,  -- NULL = Inventarfund ohne Meldung
     risk_level         text        NOT NULL
         CHECK (risk_level IN ('critical', 'high', 'medium', 'low', 'info')),
     risk_rank          smallint    GENERATED ALWAYS AS (m4.risk_rank(risk_level)) STORED,
@@ -212,6 +212,7 @@ CREATE TABLE m4.notification_log (
     CHECK (status NOT IN ('failed', 'skipped') OR error_message IS NOT NULL)
 );
 
+COMMENT ON COLUMN m4.notification_log.raw_item_id IS 'NULL bei Inventarfunden. /notify sendet nur sofort, wenn m3.findings_current.immediate_notify wahr ist.';
 COMMENT ON COLUMN m4.notification_log.scheduled_for IS 'Wann der Eintrag faellig ist: sofort bei immediate, naechster Tages- bzw. Wochentermin bei daily/weekly.';
 COMMENT ON COLUMN m4.notification_log.next_attempt_at IS 'Nach einem Fehlschlag: frueheste naechste Wiederholung. NULL = keine weitere Wiederholung.';
 COMMENT ON COLUMN m4.notification_log.digest_id IS 'Gleiche ID = in derselben Sammelnachricht verschickt.';
@@ -227,9 +228,13 @@ CREATE INDEX notification_log_recipient_idx ON m4.notification_log (recipient_id
 -- ---------------------------------------------------------------- item_status
 -- Bearbeitungsstatus je Meldung. Eigene Tabelle, weil raw_items M1 gehoert.
 -- Keine Zeile = Status "new". Aenderungen stehen zusaetzlich im audit_log.
+-- Eine Zeile gehoert entweder zu einer Meldung (raw_item_id) oder zu einem Inventarfund ohne Meldung
+-- (match_id aus m3, wie bei notification_log ohne Fremdschluessel).
 
 CREATE TABLE m4.item_status (
-    raw_item_id bigint      PRIMARY KEY REFERENCES public.raw_items (id) ON DELETE CASCADE,
+    id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raw_item_id bigint      UNIQUE REFERENCES public.raw_items (id) ON DELETE CASCADE,
+    match_id    bigint      UNIQUE,
     status      text        NOT NULL DEFAULT 'new'
         CHECK (status IN ('new', 'in_progress', 'done', 'irrelevant')),
     note        text,
@@ -237,7 +242,9 @@ CREATE TABLE m4.item_status (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
-COMMENT ON TABLE m4.item_status IS 'Feedback je Meldung, kann spaeter zur Verbesserung der Bewertung genutzt werden.';
+ALTER TABLE m4.item_status ADD CONSTRAINT item_status_one_target CHECK (num_nonnulls(raw_item_id, match_id) = 1);
+
+COMMENT ON TABLE m4.item_status IS 'Feedback je Meldung oder Inventarfund, kann spaeter zur Verbesserung der Bewertung genutzt werden.';
 
 CREATE INDEX item_status_status_idx ON m4.item_status (status);
 

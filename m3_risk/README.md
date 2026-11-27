@@ -112,6 +112,7 @@ Gleiche Spalten, aber inklusive erledigter Treffer (`status = resolved`). Für V
 | `action_code`, `deadline_at` | Maßnahme und Frist (regelbasiert) |
 | `factor_breakdown` | Beitrag jedes Faktors zum Score (JSON), für die Begründung in der UI |
 | `assessed_at` | Zeitpunkt der Bewertung |
+| `immediate_notify` | `false` bei Inventarfunden unter `high` ohne KEV: nicht sofort benachrichtigen, nur Übersicht/Bericht |
 | `recommendations` | JSON: `{"it_security": "...", "management": "...", "executive": "..."}` |
 | `evidence` | JSON-Liste der Belege: `claim_key`, `claim_text`, `source_kind`, `raw_item_id`, `source_url` |
 

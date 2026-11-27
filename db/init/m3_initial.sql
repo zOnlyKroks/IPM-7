@@ -326,7 +326,10 @@ SELECT
     (SELECT jsonb_agg(jsonb_build_object('claim_key', e.claim_key, 'claim_text', e.claim_text,
                                          'source_kind', e.source_kind, 'raw_item_id', e.raw_item_id,
                                          'source_url', e.source_url) ORDER BY e.id)
-       FROM m3.evidence e WHERE e.risk_assessment_id = ra.id) AS evidence
+       FROM m3.evidence e WHERE e.risk_assessment_id = ra.id) AS evidence,
+    -- Inventarfunde (ohne Meldung) kommen in Mengen: sofort nur ab high oder bei KEV, sonst Uebersicht/Bericht
+    (m.raw_item_id IS NOT NULL OR coalesce(ra.risk_level IN ('critical', 'high') OR ra.kev_listed, false))
+                                      AS immediate_notify
 FROM m3.matches m
 JOIN m3.sbom_components c ON c.id = m.component_id
 JOIN m3.assets a          ON a.id = c.asset_id

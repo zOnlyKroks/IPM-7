@@ -7,7 +7,7 @@ DO $$
 DECLARE
     s bigint; r1 bigint; r2 bigint; a1 bigint; a2 bigint;
     img bigint; lib bigint; fw bigint; ai bigint;
-    m1 bigint; m2v bigint; ra1 bigint; ra2 bigint; n int;
+    m1 bigint; m2v bigint; m3i bigint; ra1 bigint; ra2 bigint; n int;
 BEGIN
     INSERT INTO public.sources(name,url,connector,source_type)
       VALUES ('m3 test','https://example.invalid','rss','authority') RETURNING id INTO s;
@@ -114,6 +114,30 @@ BEGIN
     ASSERT (SELECT dependency_path_names FROM m3.findings_history WHERE component_id=lib) = ARRAY['n8n','axios'];
     ASSERT (SELECT highest_risk_level FROM m3.assets_overview WHERE asset_key='fw-01') = 'critical';
     ASSERT (SELECT open_finding_count FROM m3.assets_overview WHERE asset_key='srv-ai') = 1;
+
+    -- Meldungstreffer duerfen immer sofort gemeldet werden (die Regeln in M4 entscheiden)
+    ASSERT (SELECT bool_and(immediate_notify) FROM m3.findings_current);
+
+    -- Inventarfund ohne Meldung: sofort nur ab high oder bei KEV
+    INSERT INTO m3.matches(component_id,cve_id,match_key,match_method,confidence,version_status,is_direct,dependency_path)
+      VALUES (fw,'CVE-2099-0002','CVE-2099-0002','cpe_version',0.95,'affected',true,ARRAY[fw]) RETURNING id INTO m3i;
+    INSERT INTO m3.risk_assessments(match_id,scoring_branch,score,risk_level,action_code,policy_version,
+        kev_listed,asset_criticality,internet_exposed,match_confidence,category,factor_breakdown,risk_fingerprint)
+      VALUES (m3i,'cve',45,'medium','patch_scheduled','v1',false,5,true,0.95,'VULNERABILITY','{}','fp3');
+    ASSERT (SELECT raw_item_id IS NULL AND NOT immediate_notify AND url LIKE '%CVE-2099-0002'
+              FROM m3.findings_current WHERE match_id=m3i), 'medium inventory finding must not be immediate';
+    UPDATE m3.risk_assessments SET kev_listed=true WHERE match_id=m3i;
+    ASSERT (SELECT immediate_notify FROM m3.findings_current WHERE match_id=m3i), 'KEV inventory finding is immediate';
+    UPDATE m3.risk_assessments SET kev_listed=false, risk_level='high' WHERE match_id=m3i;
+    ASSERT (SELECT immediate_notify FROM m3.findings_current WHERE match_id=m3i), 'high inventory finding is immediate';
+    -- derselbe Inventarfund darf nicht doppelt entstehen (NULLS NOT DISTINCT)
+    BEGIN
+        INSERT INTO m3.matches(component_id,cve_id,match_key,match_method,confidence,version_status,is_direct,dependency_path)
+          VALUES (fw,'CVE-2099-0002','CVE-2099-0002','cpe_version',0.95,'affected',true,ARRAY[fw]);
+        RAISE EXCEPTION 'duplicate inventory match accepted';
+    EXCEPTION WHEN unique_violation THEN NULL; END;
+    DELETE FROM m3.risk_assessments WHERE match_id=m3i;
+    DELETE FROM m3.matches WHERE id=m3i;
 
     -- Upgrade-Szenario: Treffer erledigt -> verschwindet aus current, bleibt in history
     UPDATE m3.matches SET status='resolved', resolved_at=now(), resolved_reason='version_not_affected' WHERE id=m1;
